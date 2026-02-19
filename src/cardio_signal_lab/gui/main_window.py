@@ -812,6 +812,18 @@ class MainWindow(QMainWindow):
                 self._channel_state.clear()  # Discard per-channel state from any previous file
                 self._structural_ops.clear()
 
+                # Show warning if any streams were skipped due to corruption
+                if hasattr(loader, 'skipped_streams') and loader.skipped_streams:
+                    skipped_names = ", ".join(loader.skipped_streams)
+                    QMessageBox.warning(
+                        self,
+                        "Data Quality Warning",
+                        f"One or more signal streams could not be loaded due to timestamp corruption:\n\n"
+                        f"Skipped: {skipped_names}\n\n"
+                        f"Available signals ({session.num_signals}) are loaded and ready for analysis.\n\n"
+                        f"Check the log panel (View → Log Panel) for details."
+                    )
+
                 self._show_metadata_dialog(session)
                 self.signals.file_loaded.emit(session)
 
@@ -827,8 +839,25 @@ class MainWindow(QMainWindow):
             logger.error(f"File not found: {e}")
             QMessageBox.critical(self, "File Not Found", f"The file could not be found:\n{e}")
         except ValueError as e:
-            logger.error(f"Invalid file format: {e}")
-            QMessageBox.critical(self, "Invalid File", f"The file format is invalid:\n{e}")
+            error_msg = str(e)
+            logger.error(f"Invalid file format: {error_msg}")
+
+            # Check if this is a structural corruption error
+            if "length mismatch" in error_msg.lower():
+                QMessageBox.critical(
+                    self,
+                    "File Corrupted - Action Required",
+                    "This XDF file has a structural corruption (length mismatch between data and timestamps).\n\n"
+                    "This cannot be automatically fixed.\n\n"
+                    "Please fix the file by:\n"
+                    "1. Open the file in MATLAB\n"
+                    "2. Wait for MATLAB to raise an exception\n"
+                    "3. Delete the extra sample value as indicated\n"
+                    "4. Re-save the file\n\n"
+                    "Then you can load it here."
+                )
+            else:
+                QMessageBox.critical(self, "Invalid File", f"The file format is invalid:\n{error_msg}")
         except Exception as e:
             logger.exception(f"Unexpected error loading file: {e}")
             QMessageBox.critical(self, "Error", f"An unexpected error occurred:\n{e}")

@@ -87,6 +87,7 @@ class XdfLoader:
             apply_lsl_alignment: Use LSL timestamps for alignment (default: False, uses device timestamps)
         """
         self.apply_lsl_alignment = apply_lsl_alignment
+        self.skipped_streams = []  # Track streams that failed to load
 
     def can_load(self, path: Path) -> bool:
         """Check if file is XDF format."""
@@ -105,6 +106,9 @@ class XdfLoader:
             FileNotFoundError: If file doesn't exist
             ValueError: If XDF format is invalid
         """
+        # Reset skipped streams list for this load
+        self.skipped_streams = []
+
         # Layered validation: type → exists → format
         if not isinstance(path, Path):
             try:
@@ -171,6 +175,9 @@ class XdfLoader:
 
         Returns:
             Tuple of (streams, header)
+
+        Raises:
+            ValueError: If file has structural corruption (length mismatch)
         """
         # Define selective stream queries for physiological signals and events
         select_queries = [
@@ -197,14 +204,43 @@ class XdfLoader:
                 logger.warning("No streams matched queries, loading all streams")
                 streams, header = pyxdf.load_xdf(str(path))
         except Exception as e:
+            # Check for struct.error which indicates file truncation/length mismatch
+            if "unpack requires a buffer" in str(e):
+                logger.error(f"File has structural corruption (length mismatch): {e}")
+                raise ValueError(
+                    f"XDF file is corrupted with a length mismatch between data samples and timestamps. "
+                    f"This cannot be automatically fixed. "
+                    f"Please re-save the file in MATLAB using the standard load/save procedure. "
+                    f"This will properly align all data streams. "
+                    f"(Technical: {e})"
+                )
+
             logger.warning(f"Selective loading failed: {e}, loading all streams")
-            streams, header = pyxdf.load_xdf(str(path))
+            try:
+                streams, header = pyxdf.load_xdf(str(path))
+            except Exception as e2:
+                if "unpack requires a buffer" in str(e2):
+                    logger.error(f"File has structural corruption (length mismatch): {e2}")
+                    raise ValueError(
+                        f"XDF file is corrupted with a length mismatch between data samples and timestamps. "
+                        f"This cannot be automatically fixed. "
+                        f"Please re-save the file in MATLAB using the standard load/save procedure. "
+                        f"This will properly align all data streams. "
+                        f"(Technical: {e2})"
+                    )
+                raise
 
         logger.info(f"Loaded {len(streams)} streams from XDF")
         return streams, header
 
     def _extract_signals_from_stream(self, stream: dict, lsl_t0_reference: float) -> list[SignalData]:
         """Extract SignalData objects from an XDF stream.
+
+        4-tier fallback strategy for corrupted timestamps:
+        1. Use LSL timestamps if clean
+        2. If LSL corrupted but fixable, repair and use
+        3. If not fixable, try device timestamps
+        4. If device timestamps also corrupted, skip the signal
 
         Args:
             stream: XDF stream dict
@@ -223,39 +259,85 @@ class XdfLoader:
         # Validate sampling rate
         if not self._validate_sampling_rate(sampling_rate, stream_name):
             logger.error(f"Skipping stream '{stream_name}' due to invalid sampling rate")
+            self.skipped_streams.append(stream_name)
             return []
 
         # Detect signal type from stream metadata (used as fallback)
         stream_signal_type = self._detect_signal_type(stream["info"])
 
-        # Use raw LSL timestamps as the authoritative time axis.
-        # Zero-reference to the common lsl_t0_reference so all streams share the same origin.
-        lsl_timestamps = stream["time_stamps"].astype(np.float64)
-        timestamps = lsl_timestamps - lsl_t0_reference
-
-        # Validate timestamps
-        if not self._validate_timestamps(timestamps, stream_name):
-            logger.warning(f"Timestamps not monotonic for '{stream_name}', but continuing load")
-
-        # Extract channel names
+        # Extract channel names and time series
         channel_names = self._extract_channel_names(stream["info"])
-
-        # Extract time series data
         time_series = stream["time_series"]
+        lsl_timestamps = stream["time_stamps"].astype(np.float64)
 
         # Handle timestamp column (first column in Shimmer streams)
+        has_device_timestamps = False
         if "shimmer" in stream_name.lower() or time_series.shape[1] == len(channel_names):
             # First column is device timestamp
+            has_device_timestamps = True
             start_col = 1
             channel_names = channel_names[1:]  # Skip timestamp column
+            device_timestamps_raw = time_series[:, 0].astype(np.float64)
         else:
             start_col = 0
+            device_timestamps_raw = None
+
+        # TIER 1: Try LSL timestamps first
+        lsl_timestamps_zeroed = lsl_timestamps - lsl_t0_reference
+        lsl_corruption_info = self._assess_timestamp_corruption(lsl_timestamps_zeroed, stream_name, "LSL")
+        valid_mask = None
+
+        if lsl_corruption_info["is_clean"]:
+            logger.info(f"Using LSL timestamps for '{stream_name}' (clean)")
+            timestamps = lsl_timestamps_zeroed
+            timestamp_source = "LSL"
+        # TIER 2: Try to repair LSL timestamps if fixable
+        elif lsl_corruption_info["is_fixable"]:
+            logger.warning(f"LSL timestamps corrupted but fixable for '{stream_name}': {lsl_corruption_info['backward_jumps']} backward jumps")
+            result = self._repair_lsl_timestamps(lsl_timestamps_zeroed, stream_name)
+            if result is not None:
+                timestamps, valid_mask = result
+                timestamp_source = "LSL (repaired)"
+                logger.info(f"Successfully repaired LSL timestamps for '{stream_name}'")
+            else:
+                timestamps = None
+        else:
+            timestamps = None
+
+        # TIER 3: If LSL failed, try device timestamps
+        if timestamps is None and has_device_timestamps:
+            device_timestamps_s = device_timestamps_raw / 1000.0  # Convert ms to seconds
+            device_corruption_info = self._assess_timestamp_corruption(device_timestamps_s, stream_name, "Device")
+
+            if device_corruption_info["is_clean"]:
+                logger.info(f"Falling back to device timestamps for '{stream_name}' (clean)")
+                timestamps = device_timestamps_s - device_timestamps_s[0]  # Zero-reference
+                timestamp_source = "Device"
+            elif device_corruption_info["is_fixable"]:
+                logger.warning(f"Device timestamps corrupted but fixable for '{stream_name}'")
+                result = self._repair_lsl_timestamps(device_timestamps_s - device_timestamps_s[0], stream_name)
+                if result is not None:
+                    timestamps, valid_mask = result
+                    timestamp_source = "Device (repaired)"
+                    logger.info(f"Successfully repaired device timestamps for '{stream_name}'")
+            else:
+                logger.error(f"Both LSL and device timestamps severely corrupted for '{stream_name}' ({device_corruption_info['backward_jumps']} backward jumps) - skipping all channels")
+
+        # TIER 4: If all timestamp sources failed, skip this stream
+        if timestamps is None:
+            logger.error(f"Failed to obtain usable timestamps for stream '{stream_name}' - skipping")
+            self.skipped_streams.append(stream_name)
+            return []
 
         # Create SignalData for each channel
         for i, channel_name in enumerate(channel_names):
             col_idx = start_col + i
             if col_idx < time_series.shape[1]:
                 samples = time_series[:, col_idx].astype(np.float64)
+
+                # Filter samples if timestamps were repaired
+                if valid_mask is not None:
+                    samples = samples[valid_mask]
 
                 # Skip channels with all zeros or NaNs
                 if np.all(samples == 0) or np.all(np.isnan(samples)):
@@ -265,12 +347,14 @@ class XdfLoader:
                 # Validate signal values
                 if not self._validate_signal_values(samples, channel_name):
                     logger.warning(f"Signal '{channel_name}' failed validation, but including in session")
-                    # Continue anyway - validation warnings are informational
 
-                # Per-channel signal type detection (e.g., GSR vs PPG from same stream)
+                # Per-channel signal type detection
                 channel_type = detect_signal_type_from_name(channel_name)
                 if channel_type == SignalType.UNKNOWN:
                     channel_type = stream_signal_type
+
+                # Filter LSL timestamps if applicable
+                lsl_ts_filtered = lsl_timestamps if valid_mask is None else lsl_timestamps[valid_mask]
 
                 signal = SignalData(
                     samples=samples,
@@ -278,11 +362,11 @@ class XdfLoader:
                     timestamps=timestamps,
                     channel_name=channel_name,
                     signal_type=channel_type,
-                    lsl_timestamps=lsl_timestamps,
+                    lsl_timestamps=lsl_ts_filtered,
                 )
                 signals.append(signal)
 
-        logger.debug(f"Extracted {len(signals)} signals from stream '{stream_name}'")
+        logger.debug(f"Extracted {len(signals)} signals from stream '{stream_name}' (timestamps: {timestamp_source})")
         return signals
 
     def _extract_channel_names(self, stream_info: dict) -> list[str]:
@@ -509,6 +593,95 @@ class XdfLoader:
                     )
 
         return True
+
+    def _assess_timestamp_corruption(self, timestamps: np.ndarray, stream_name: str, source: str) -> dict:
+        """Assess severity of timestamp corruption.
+
+        Args:
+            timestamps: Timestamp array to assess
+            stream_name: Stream name for logging
+            source: "LSL" or "Device" for logging context
+
+        Returns:
+            Dictionary with:
+            - is_clean: True if no corruption
+            - is_fixable: True if corruption is minor and can be repaired
+            - backward_jumps: Number of backward jumps
+            - max_backward_jump: Magnitude of worst backward jump
+        """
+        if len(timestamps) < 2:
+            return {"is_clean": True, "is_fixable": False, "backward_jumps": 0, "max_backward_jump": 0}
+
+        diffs = np.diff(timestamps)
+        backward_mask = diffs <= 0
+        backward_count = np.sum(backward_mask)
+
+        if backward_count == 0:
+            return {"is_clean": True, "is_fixable": False, "backward_jumps": 0, "max_backward_jump": 0}
+
+        # Assess if fixable
+        # Fixable if: few jumps (<100) and not too frequent (< 5% of samples)
+        backward_pct = 100.0 * backward_count / len(timestamps)
+        max_backward = np.min(diffs[backward_mask])
+
+        is_fixable = backward_count < 100 and backward_pct < 5.0
+
+        logger.debug(
+            f"{source} timestamps for '{stream_name}': "
+            f"{backward_count} backward jumps ({backward_pct:.2f}%), "
+            f"worst: {max_backward:.6f}s, fixable: {is_fixable}"
+        )
+
+        return {
+            "is_clean": False,
+            "is_fixable": is_fixable,
+            "backward_jumps": backward_count,
+            "max_backward_jump": max_backward,
+        }
+
+    def _repair_lsl_timestamps(self, timestamps: np.ndarray, stream_name: str) -> tuple[np.ndarray, np.ndarray] | None:
+        """Repair corrupted timestamps by removing out-of-order samples.
+
+        Simple strategy: remove samples with backward/flat jumps, then verify
+        the repair actually worked.
+
+        Args:
+            timestamps: Corrupted timestamp array
+            stream_name: Stream name for logging
+
+        Returns:
+            Tuple of (repaired_timestamps, valid_mask), or None if repair failed
+        """
+        if len(timestamps) < 2:
+            return timestamps, np.ones(len(timestamps), dtype=bool)
+
+        diffs = np.diff(timestamps)
+        # Keep samples where diff > 0
+        valid_mask = np.concatenate([[True], diffs > 0])
+
+        if np.sum(valid_mask) < 10:
+            logger.error(f"Repair would remove too many samples ({np.sum(~valid_mask)}/{len(timestamps)}) for '{stream_name}'")
+            return None
+
+        # Extract valid timestamps
+        repaired = timestamps[valid_mask]
+
+        # VERIFY the repair actually fixed the problem
+        repaired_diffs = np.diff(repaired)
+        repaired_backward_count = np.sum(repaired_diffs <= 0)
+
+        if repaired_backward_count > 0:
+            logger.error(
+                f"Repair failed for '{stream_name}': "
+                f"still {repaired_backward_count} backward jumps after removing {len(timestamps) - len(repaired)} samples. "
+                f"Corruption too extensive."
+            )
+            return None
+
+        removed_count = len(timestamps) - len(repaired)
+        logger.info(f"Successfully repaired timestamps: removed {removed_count} out-of-order samples from '{stream_name}'")
+
+        return repaired, valid_mask
 
 
 class CsvLoader:
@@ -958,6 +1131,726 @@ class CsvLoader:
         return events
 
 
+class MatLoader:
+    """Loader for MATLAB .mat files containing corrected XDF streams.
+
+    This loader is specifically for .mat files that were created by saving
+    corrected XDF streams from MATLAB after manual fixing in the debugger:
+        1. Load XDF in MATLAB with xdf()
+        2. Wait for error, then fix corrupted array in debugger
+        3. Save with save('xdf_data.mat', 'streams', 'header')
+        4. Load the .mat file here in CardioSignalLab
+
+    The .mat file must contain 'streams' variable (and optionally 'header').
+    """
+
+    def __init__(self, apply_lsl_alignment: bool = False):
+        """Initialize MAT loader.
+
+        Args:
+            apply_lsl_alignment: Use LSL timestamps for alignment (default: False, uses device timestamps)
+        """
+        self.apply_lsl_alignment = apply_lsl_alignment
+        self.skipped_streams = []  # Track streams that failed to load
+
+    def can_load(self, path: Path) -> bool:
+        """Check if file is MAT format."""
+        return path.suffix.lower() == ".mat"
+
+    def load(self, path: Path) -> RecordingSession:
+        """Load MAT file containing XDF streams.
+
+        Args:
+            path: Path to MAT file
+
+        Returns:
+            RecordingSession with loaded signals
+
+        Raises:
+            FileNotFoundError: If file doesn't exist
+            ValueError: If MAT format is invalid or doesn't contain streams
+        """
+        # Reset skipped streams list for this load
+        self.skipped_streams = []
+
+        # Layered validation: type → exists → format
+        if not isinstance(path, Path):
+            try:
+                path = Path(path)
+            except Exception:
+                raise TypeError(f"path must be a Path object or string, got {type(path).__name__}")
+
+        if not path.exists():
+            raise FileNotFoundError(f"MAT file not found: {path}")
+
+        if not path.is_file():
+            raise ValueError(f"Path is not a file: {path}")
+
+        if path.suffix.lower() != ".mat":
+            raise ValueError(f"Invalid file extension, expected .mat, got {path.suffix}")
+
+        logger.info(f"Loading MAT file: {path}")
+
+        # Load MAT file
+        try:
+            import scipy.io
+            mat_data = scipy.io.loadmat(str(path), squeeze_me=True)
+        except ImportError:
+            raise ValueError("scipy not installed. Install with: pip install scipy")
+        except Exception as e:
+            raise ValueError(f"Failed to load MAT file: {e}")
+
+        # Extract streams and header
+        if 'streams' not in mat_data:
+            raise ValueError("MAT file must contain 'streams' variable")
+
+        streams_mat = mat_data['streams']
+        header = mat_data.get('header', None)
+
+        # Convert MATLAB structure to pyxdf format
+        streams = self._matlab_to_xdf_structure(streams_mat)
+
+        if not streams:
+            raise ValueError(f"No streams found in MAT file: {path}")
+
+        # Determine LSL t0 reference from the first physiological signal stream
+        lsl_t0_reference: float | None = None
+        for stream in streams:
+            timestamps = stream.get('time_stamps')
+            if timestamps is not None:
+                # Handle both arrays and scalars (scipy squeeze_me=True may return scalars)
+                try:
+                    ts_array = np.asarray(timestamps)
+                    if ts_array.size > 0:
+                        lsl_t0_reference = float(ts_array.flat[0])
+                        logger.debug(f"LSL t0 reference: {lsl_t0_reference:.6f} s (absolute LSL clock)")
+                        break
+                except (TypeError, ValueError):
+                    continue
+
+        if lsl_t0_reference is None:
+            raise ValueError(f"No valid timestamp streams found in MAT file: {path}")
+
+        # Extract signals from streams (skip marker/event streams)
+        signals = []
+        for i, stream in enumerate(streams):
+            # Skip marker/event streams (time_series is list or array of strings/objects)
+            ts = stream.get("time_series")
+            is_marker_stream = False
+
+            if isinstance(ts, list):
+                is_marker_stream = True
+            elif isinstance(ts, np.ndarray):
+                # Check if it's a string or object array (markers)
+                if ts.dtype.kind in ['U', 'S']:  # Unicode or byte string
+                    is_marker_stream = True
+                elif ts.dtype.kind == 'O' and len(ts) > 0:  # Object array - check first element
+                    try:
+                        if isinstance(ts.flat[0], (str, bytes)):
+                            is_marker_stream = True
+                    except (IndexError, TypeError):
+                        pass
+
+            if is_marker_stream:
+                logger.debug(f"Stream {i}: Skipping marker stream (string data)")
+                continue
+
+            signal_list = self._extract_signals_from_stream(stream, lsl_t0_reference)
+            signals.extend(signal_list)
+
+        if not signals:
+            raise ValueError(f"No physiological signals found in MAT file: {path}")
+
+        logger.info(f"Loaded {len(signals)} signals from MAT file")
+
+        # Extract events from marker streams if present
+        events = self._extract_events_from_streams(streams, lsl_t0_reference)
+
+        return RecordingSession(
+            source_path=path,
+            signals=signals,
+            events=events,
+            lsl_t0_reference=lsl_t0_reference,
+        )
+
+    def _matlab_to_xdf_structure(self, streams_mat) -> list:
+        """Convert MATLAB streams structure to pyxdf format.
+
+        MATLAB saves streams as: (info_struct, time_series, time_stamps) or similar tuples.
+        scipy.io.loadmat may return these as numpy record arrays or tuples.
+
+        Args:
+            streams_mat: MATLAB streams structure (from scipy.io.loadmat)
+
+        Returns:
+            List of stream dicts in pyxdf format
+        """
+        # Ensure streams_mat is iterable
+        try:
+            if hasattr(streams_mat, 'shape') and len(streams_mat.shape) > 0:
+                streams_list = list(streams_mat)
+            elif isinstance(streams_mat, (list, tuple)):
+                streams_list = list(streams_mat)
+            else:
+                streams_list = [streams_mat]
+        except Exception:
+            streams_list = [streams_mat]
+
+        streams = []
+        for i, stream_mat in enumerate(streams_list):
+            try:
+                # Handle tuple format: (info_struct, optional_chunk_info, time_series, time_stamps)
+                # or dict format: {'info': ..., 'time_series': ..., 'time_stamps': ...}
+
+                if isinstance(stream_mat, tuple):
+                    # MATLAB saved as tuple format
+                    logger.debug(f"Stream {i}: Processing tuple format with {len(stream_mat)} elements")
+
+                    if len(stream_mat) >= 3:
+                        # Last two elements are typically time_series and time_stamps
+                        info_data = stream_mat[0]
+                        # Find time_series and time_stamps (usually last two elements)
+                        time_series_data = stream_mat[-2] if len(stream_mat) >= 2 else None
+                        time_stamps_data = stream_mat[-1] if len(stream_mat) >= 1 else None
+                    else:
+                        info_data = stream_mat[0] if len(stream_mat) > 0 else None
+                        time_series_data = stream_mat[1] if len(stream_mat) > 1 else None
+                        time_stamps_data = stream_mat[2] if len(stream_mat) > 2 else None
+
+                elif isinstance(stream_mat, np.ndarray) and stream_mat.dtype.names:
+                    # numpy record array with named fields
+                    logger.debug(f"Stream {i}: Processing numpy record array with fields {stream_mat.dtype.names}")
+
+                    # Extract fields from the record array
+                    # Handle the case where records might be stored as arrays of records
+                    if stream_mat.ndim == 0:
+                        # Scalar record (0-d array)
+                        stream_mat = np.atleast_1d(stream_mat)[0]
+
+                    # Extract each field
+                    try:
+                        info_data = stream_mat['info'] if 'info' in stream_mat.dtype.names else stream_mat
+                        time_series_data = stream_mat['time_series'] if 'time_series' in stream_mat.dtype.names else None
+                        time_stamps_data = stream_mat['time_stamps'] if 'time_stamps' in stream_mat.dtype.names else None
+                    except (IndexError, TypeError) as e:
+                        logger.warning(f"Could not extract fields from record array: {e}")
+                        info_data = stream_mat
+                        time_series_data = None
+                        time_stamps_data = None
+
+                elif isinstance(stream_mat, dict):
+                    # Dict format
+                    info_data = stream_mat.get('info')
+                    time_series_data = stream_mat.get('time_series')
+                    time_stamps_data = stream_mat.get('time_stamps')
+
+                else:
+                    logger.warning(f"Stream {i}: Unknown format {type(stream_mat)}")
+                    continue
+
+                stream = {
+                    'info': self._convert_info_struct(info_data) if info_data is not None else {},
+                    'time_series': np.asarray(time_series_data) if time_series_data is not None else np.array([]),
+                    'time_stamps': np.asarray(time_stamps_data) if time_stamps_data is not None else np.array([])
+                }
+                streams.append(stream)
+            except Exception as e:
+                logger.warning(f"Error processing stream {i}: {e}, skipping")
+                import traceback
+                logger.debug(traceback.format_exc())
+                continue
+
+        return streams
+
+    def _convert_info_struct(self, info_mat) -> dict:
+        """Convert MATLAB info structure to Python dict.
+
+        Args:
+            info_mat: MATLAB info structure (numpy record array or dict)
+
+        Returns:
+            Python dict
+        """
+        info = {}
+
+        if isinstance(info_mat, dict):
+            # Dict-like structure
+            for key, value in info_mat.items():
+                # Convert MATLAB cell arrays and nested structures to Python
+                if hasattr(value, 'size'):  # numpy array
+                    if value.size == 1:
+                        info[key] = value.item()
+                    else:
+                        info[key] = value.tolist()
+                elif isinstance(value, dict):
+                    info[key] = self._convert_info_struct(value)
+                else:
+                    info[key] = value
+
+        elif isinstance(info_mat, np.ndarray) and info_mat.dtype.names:
+            # Structured array (record array)
+            # Handle both regular and 0-d arrays
+            if info_mat.ndim == 0:
+                info_mat = np.atleast_1d(info_mat)[0]
+
+            for field_name in info_mat.dtype.names:
+                try:
+                    value = info_mat[field_name]
+
+                    # Recursively convert nested structures
+                    if isinstance(value, np.ndarray):
+                        if value.dtype.names:  # Nested structured array
+                            info[field_name] = self._convert_info_struct(value)
+                        elif value.size == 1:
+                            info[field_name] = value.item()
+                        else:
+                            info[field_name] = value.tolist()
+                    elif isinstance(value, dict):
+                        info[field_name] = self._convert_info_struct(value)
+                    else:
+                        info[field_name] = value
+                except (IndexError, TypeError):
+                    continue
+
+        else:
+            # Try to convert as-is
+            try:
+                if hasattr(info_mat, 'size') and info_mat.size == 1:
+                    info = info_mat.item()
+                else:
+                    info = info_mat
+            except Exception:
+                info = info_mat
+
+        return info
+
+    def _extract_signals_from_stream(self, stream: dict, lsl_t0_reference: float) -> list[SignalData]:
+        """Extract SignalData objects from a stream.
+
+        Handles both single-channel and multi-channel streams.
+        Uses the same 4-tier fallback strategy as XdfLoader for timestamp validation.
+
+        Args:
+            stream: Stream dict
+            lsl_t0_reference: First LSL timestamp reference
+
+        Returns:
+            List of SignalData objects
+        """
+        # Skip marker streams
+        if isinstance(stream.get("time_series"), list):
+            return []
+
+        info = stream.get("info", {})
+        stream_name = info.get("name", "Unknown")
+        if isinstance(stream_name, list):
+            stream_name = stream_name[0] if stream_name else "Unknown"
+
+        # Extract signal data
+        samples_raw = stream.get("time_series", np.array([]))
+        timestamps = stream.get("time_stamps", np.array([]))
+
+        if len(samples_raw) == 0 or len(timestamps) == 0:
+            logger.warning(f"Skipping stream '{stream_name}': empty data")
+            return []
+
+        # Handle multi-channel data (2D arrays)
+        # If samples_raw is 2D, each row is a separate channel
+        if isinstance(samples_raw, np.ndarray) and samples_raw.ndim == 2:
+            # Multi-channel: (channels, samples)
+            channels = samples_raw.shape[0]
+            logger.info(f"Stream '{stream_name}' has {channels} channels")
+
+            # Get channel names from info if available
+            # For Shimmer GSR devices: typically [timestamps_placeholder, GSR, Internal_ADC_A13]
+            if stream_name.lower() == "gsr" and channels == 3:
+                channel_names = ["timestamps", "GSR", "Internal ADC A13"]
+            else:
+                channel_names = self._get_channel_names(info, channels, stream_name)
+
+            signals = []
+            for ch_idx in range(channels):
+                # Skip 'timestamps' placeholder channel (first channel in Shimmer)
+                if channel_names[ch_idx].lower() == 'timestamps':
+                    logger.debug(f"Skipping timestamps placeholder channel")
+                    continue
+
+                samples = samples_raw[ch_idx, :]
+
+                # Validate and repair timestamps (4-tier strategy)
+                ch_samples, ch_timestamps = self._validate_and_repair_timestamps(
+                    samples, timestamps, f"{stream_name}_ch{ch_idx + 1}"
+                )
+
+                if ch_samples is None:
+                    self.skipped_streams.append(f"{stream_name}_ch{ch_idx + 1}")
+                    continue
+
+                # Zero-reference timestamps
+                ch_timestamps = ch_timestamps - lsl_t0_reference
+
+                # Calculate sampling rate
+                if len(ch_timestamps) > 1:
+                    time_diffs = np.diff(ch_timestamps)
+                    sampling_rate = 1.0 / np.mean(time_diffs)
+                else:
+                    sampling_rate = 1.0
+
+                # Validate sampling rate
+                self._validate_sampling_rate(sampling_rate, channel_names[ch_idx])
+
+                # Detect signal type from channel name
+                detected_type = detect_signal_type_from_name(channel_names[ch_idx])
+
+                signal = SignalData(
+                    samples=ch_samples,
+                    sampling_rate=sampling_rate,
+                    timestamps=ch_timestamps,
+                    channel_name=channel_names[ch_idx],
+                    signal_type=detected_type,
+                )
+                signals.append(signal)
+
+            return signals
+
+        else:
+            # Single channel
+            samples = np.asarray(samples_raw)
+            if samples.ndim != 1:
+                samples = samples.flatten()
+
+            # Validate and repair timestamps (4-tier strategy)
+            samples, timestamps = self._validate_and_repair_timestamps(
+                samples, timestamps, stream_name
+            )
+
+            if samples is None:
+                self.skipped_streams.append(stream_name)
+                return []
+
+            # Zero-reference timestamps
+            timestamps = timestamps - lsl_t0_reference
+
+            # Calculate sampling rate
+            if len(timestamps) > 1:
+                time_diffs = np.diff(timestamps)
+                sampling_rate = 1.0 / np.mean(time_diffs)
+            else:
+                sampling_rate = 1.0
+
+            # Validate sampling rate
+            self._validate_sampling_rate(sampling_rate, stream_name)
+
+            # Detect signal type
+            detected_type = self._detect_signal_type_from_stream_info(info)
+
+            signal = SignalData(
+                samples=samples,
+                sampling_rate=sampling_rate,
+                timestamps=timestamps,
+                channel_name=stream_name,
+                signal_type=detected_type,
+            )
+
+            return [signal]
+
+    def _validate_and_repair_timestamps(
+        self, samples: np.ndarray, timestamps: np.ndarray, stream_name: str
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+        """4-tier fallback strategy for timestamp validation.
+
+        1. Use timestamps if clean
+        2. If corrupted but fixable, repair
+        3. If not fixable, skip the stream
+        4. (No device timestamps in MAT files)
+
+        Args:
+            samples: Signal samples
+            timestamps: Timestamp array
+            stream_name: Stream name for logging
+
+        Returns:
+            (samples, timestamps) if valid, (None, None) if skipped
+        """
+        # Ensure arrays are numeric
+        samples = np.asarray(samples, dtype=np.float64)
+        timestamps = np.asarray(timestamps, dtype=np.float64)
+
+        # Validate timestamps
+        assessment = self._assess_timestamp_corruption(timestamps, stream_name, "MAT")
+
+        if assessment["is_clean"]:
+            logger.info(f"Stream '{stream_name}': timestamps are clean")
+            return samples, timestamps
+
+        # Try to repair if fixable
+        if assessment["is_fixable"]:
+            logger.info(
+                f"Stream '{stream_name}': corrupted but fixable "
+                f"({assessment['backward_jumps']} backward jumps)"
+            )
+            repaired = self._repair_lsl_timestamps(timestamps, stream_name)
+            if repaired is not None:
+                repaired_timestamps, valid_mask = repaired
+                # Also trim samples to match
+                repaired_samples = samples[valid_mask]
+                return repaired_samples, repaired_timestamps
+
+        # Can't repair
+        logger.error(
+            f"Stream '{stream_name}': corrupted and cannot be repaired "
+            f"({assessment['backward_jumps']} backward jumps, "
+            f"{100.0 * assessment['backward_jumps'] / len(timestamps):.1f}%)"
+        )
+        return None, None
+
+    def _get_channel_names(self, stream_info: dict, num_channels: int, stream_name: str) -> list[str]:
+        """Get channel names from stream info or generate them.
+
+        Args:
+            stream_info: Stream info dict (numpy record array)
+            num_channels: Number of channels
+            stream_name: Default stream name
+
+        Returns:
+            List of channel names
+        """
+        channel_names = []
+
+        # Try to extract channel names from Shimmer-style desc/channels metadata
+        try:
+            if isinstance(stream_info, np.ndarray) and stream_info.dtype.names:
+                stream_info_scalar = np.atleast_1d(stream_info)[0]
+
+                if 'desc' in stream_info_scalar.dtype.names:
+                    desc = stream_info_scalar['desc']
+
+                    if isinstance(desc, np.ndarray) and desc.dtype.names:
+                        desc_scalar = np.atleast_1d(desc)[0]
+
+                        if 'channels' in desc_scalar.dtype.names:
+                            channels_wrapper = desc_scalar['channels']
+
+                            # Unwrap the nested array structure
+                            if isinstance(channels_wrapper, np.ndarray):
+                                if channels_wrapper.ndim == 0:
+                                    channels_wrapper = np.atleast_1d(channels_wrapper)
+
+                                # Try to iterate through channels
+                                if channels_wrapper.size > 0:
+                                    channels_data = channels_wrapper.flat[0]
+
+                                    if isinstance(channels_data, np.ndarray):
+                                        # Each channel is a record with 'label' and 'unit'
+                                        for ch_item in channels_data:
+                                            try:
+                                                if isinstance(ch_item, np.ndarray):
+                                                    ch_scalar = np.atleast_1d(ch_item)[0]
+                                                    if hasattr(ch_scalar, 'dtype') and 'label' in ch_scalar.dtype.names:
+                                                        label = ch_scalar['label']
+                                                        if isinstance(label, np.ndarray):
+                                                            label = label.flat[0]
+                                                        label_str = str(label)
+                                                        # Skip 'timestamps' placeholder
+                                                        if label_str.lower() != 'timestamps':
+                                                            channel_names.append(label_str)
+                                            except (IndexError, TypeError, AttributeError):
+                                                continue
+        except Exception as e:
+            logger.debug(f"Could not extract channel names from desc: {e}")
+
+        # Fill in any missing channel names
+        while len(channel_names) < num_channels:
+            ch_idx = len(channel_names) + 1
+            channel_names.append(f"{stream_name}_ch{ch_idx}")
+
+        return channel_names[:num_channels]
+
+    def _detect_signal_type_from_stream_info(self, stream_info: dict) -> SignalType:
+        """Detect signal type from stream metadata.
+
+        Args:
+            stream_info: Stream info dict
+
+        Returns:
+            Detected SignalType
+        """
+        stream_name = stream_info.get("name", "")
+        if isinstance(stream_name, list):
+            stream_name = stream_name[0] if stream_name else ""
+
+        stream_type = ""
+        if "type" in stream_info:
+            st = stream_info["type"]
+            stream_type = st[0] if isinstance(st, list) else st
+
+        combined = f"{stream_name} {stream_type}".upper()
+
+        if "ECG" in combined:
+            return SignalType.ECG
+        elif "PPG" in combined or "GSR" in combined:
+            return SignalType.PPG
+        elif "EDA" in combined or "ELECTRODERMAL" in combined:
+            return SignalType.EDA
+        else:
+            return SignalType.UNKNOWN
+
+    def _extract_events_from_streams(self, streams: list, lsl_t0_reference: float) -> list[EventData]:
+        """Extract events from marker streams.
+
+        Args:
+            streams: List of streams
+            lsl_t0_reference: LSL t0 reference
+
+        Returns:
+            List of EventData objects
+        """
+        events = []
+
+        for stream in streams:
+            info = stream.get("info", {})
+            stream_type = ""
+            if "type" in info:
+                st = info["type"]
+                stream_type = st[0] if isinstance(st, list) else st
+
+            # Skip non-marker streams
+            if stream_type.lower() not in ["markers", "marker", "events", "event"]:
+                continue
+
+            time_series = stream.get("time_series")
+            if not isinstance(time_series, list):
+                continue
+
+            time_stamps = stream.get("time_stamps", np.array([]))
+            stream_name = info.get("name", "Unknown")
+            if isinstance(stream_name, list):
+                stream_name = stream_name[0] if stream_name else "Unknown"
+
+            logger.info(f"Found event stream: {stream_name} with {len(time_series)} events")
+
+            # Zero-reference using LSL t0
+            time_stamps = np.array(time_stamps, dtype=np.float64)
+            time_stamps = time_stamps - lsl_t0_reference
+
+            # Extract events
+            for marker, timestamp in zip(time_series, time_stamps):
+                if isinstance(marker, list):
+                    label = marker[0] if marker else "unknown"
+                else:
+                    label = str(marker)
+
+                event = EventData(
+                    timestamp=float(timestamp),
+                    label=label,
+                    duration=None,
+                    metadata={"stream": stream_name}
+                )
+                events.append(event)
+
+        return events
+
+    def _assess_timestamp_corruption(self, timestamps: np.ndarray, stream_name: str, source: str) -> dict:
+        """Assess severity of timestamp corruption.
+
+        Args:
+            timestamps: Timestamp array to assess
+            stream_name: Stream name for logging
+            source: "MAT" for logging context
+
+        Returns:
+            Dictionary with corruption assessment
+        """
+        if len(timestamps) < 2:
+            return {"is_clean": True, "is_fixable": False, "backward_jumps": 0, "max_backward_jump": 0}
+
+        diffs = np.diff(timestamps)
+        backward_mask = diffs <= 0
+        backward_count = np.sum(backward_mask)
+
+        if backward_count == 0:
+            return {"is_clean": True, "is_fixable": False, "backward_jumps": 0, "max_backward_jump": 0}
+
+        # Assess if fixable
+        backward_pct = 100.0 * backward_count / len(timestamps)
+        max_backward = np.min(diffs[backward_mask])
+
+        is_fixable = backward_count < 100 and backward_pct < 5.0
+
+        logger.debug(
+            f"{source} timestamps for '{stream_name}': "
+            f"{backward_count} backward jumps ({backward_pct:.2f}%), "
+            f"worst: {max_backward:.6f}s, fixable: {is_fixable}"
+        )
+
+        return {
+            "is_clean": False,
+            "is_fixable": is_fixable,
+            "backward_jumps": backward_count,
+            "max_backward_jump": max_backward,
+        }
+
+    def _repair_lsl_timestamps(self, timestamps: np.ndarray, stream_name: str) -> tuple[np.ndarray, np.ndarray] | None:
+        """Repair corrupted timestamps by removing out-of-order samples.
+
+        Args:
+            timestamps: Corrupted timestamp array
+            stream_name: Stream name for logging
+
+        Returns:
+            (repaired_timestamps, valid_mask), or None if repair failed
+        """
+        if len(timestamps) < 2:
+            return timestamps, np.ones(len(timestamps), dtype=bool)
+
+        diffs = np.diff(timestamps)
+        valid_mask = np.concatenate([[True], diffs > 0])
+
+        if np.sum(valid_mask) < 10:
+            logger.error(f"Repair would remove too many samples ({np.sum(~valid_mask)}/{len(timestamps)}) for '{stream_name}'")
+            return None
+
+        repaired = timestamps[valid_mask]
+
+        # Verify repair worked
+        repaired_diffs = np.diff(repaired)
+        repaired_backward_count = np.sum(repaired_diffs <= 0)
+
+        if repaired_backward_count > 0:
+            logger.error(
+                f"Repair failed for '{stream_name}': "
+                f"still {repaired_backward_count} backward jumps after removing {len(timestamps) - len(repaired)} samples"
+            )
+            return None
+
+        removed_count = len(timestamps) - len(repaired)
+        logger.info(f"Successfully repaired timestamps: removed {removed_count} out-of-order samples from '{stream_name}'")
+
+        return repaired, valid_mask
+
+    def _validate_sampling_rate(self, sampling_rate: float, stream_name: str) -> bool:
+        """Validate sampling rate is reasonable.
+
+        Args:
+            sampling_rate: Sampling rate in Hz
+            stream_name: Name of stream for error messages
+
+        Returns:
+            True if valid
+        """
+        if sampling_rate <= 0:
+            logger.error(f"Invalid sampling rate for '{stream_name}': {sampling_rate} Hz (must be positive)")
+            return False
+
+        if sampling_rate < 16 or sampling_rate > 2000:
+            logger.warning(
+                f"Unusual sampling rate for '{stream_name}': {sampling_rate} Hz "
+                f"(expected 16-2000 Hz for physiological signals)"
+            )
+
+        return True
+
+
 def get_loader(path: Path) -> FileLoader:
     """Get appropriate file loader for the given path.
 
@@ -976,8 +1869,8 @@ def get_loader(path: Path) -> FileLoader:
     """
     path = Path(path)
 
-    # Try each loader
-    loaders = [XdfLoader(), CsvLoader()]
+    # Try each loader (order matters - try specific formats before generic ones)
+    loaders = [XdfLoader(), MatLoader(), CsvLoader()]
 
     for loader in loaders:
         if loader.can_load(path):
