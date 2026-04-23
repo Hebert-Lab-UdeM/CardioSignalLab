@@ -124,6 +124,14 @@ class GUIConfig:
     signal_color_ppg: str = field(default="#d62728", validator=attrs.validators.instance_of(str))  # Red
     signal_color_eda: str = field(default="#2ca02c", validator=attrs.validators.instance_of(str))  # Green
 
+    # Operator identity (recorded in session metadata for traceability)
+    operator_name: str = field(default="", validator=attrs.validators.instance_of(str))
+
+    # Recent files (most-recent first, capped at max_recent_files)
+    recent_source_files: list = field(factory=list, validator=attrs.validators.instance_of(list))
+    recent_session_files: list = field(factory=list, validator=attrs.validators.instance_of(list))
+    max_recent_files: int = field(default=10, validator=[attrs.validators.instance_of(int), positive_int])
+
 
 @define
 class AppConfig:
@@ -233,6 +241,23 @@ class ConfigManager:
         """Save current configuration as user config."""
         if self._config is not None:
             self._config.save(self.user_config_path)
+
+    def add_recent_file(self, path: str | Path, kind: str) -> None:
+        """Prepend path to the appropriate recent-files list and persist.
+
+        Args:
+            path: File path to record
+            kind: "source" or "session"
+        """
+        config = self.get_config()
+        entry = str(Path(path).absolute())
+        if kind == "source":
+            lst = [entry] + [p for p in config.gui.recent_source_files if p != entry]
+            config.gui.recent_source_files = lst[: config.gui.max_recent_files]
+        elif kind == "session":
+            lst = [entry] + [p for p in config.gui.recent_session_files if p != entry]
+            config.gui.recent_session_files = lst[: config.gui.max_recent_files]
+        self.save_user_config()
 
     def reset_to_defaults(self) -> None:
         """Reset configuration to defaults."""

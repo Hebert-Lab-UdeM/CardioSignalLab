@@ -12,7 +12,7 @@ for %%D in (
     "C:\anaconda3"
 ) do (
     if exist "%%~D\envs\%CONDA_ENV%\pythonw.exe" (
-        start "" "%%~D\envs\%CONDA_ENV%\pythonw.exe" -c "from cardio_signal_lab.app import main; main()"
+        start "" /B "%%~D\envs\%CONDA_ENV%\python.exe" -c "from cardio_signal_lab.app import main; main()"
         exit /b 0
     )
 )

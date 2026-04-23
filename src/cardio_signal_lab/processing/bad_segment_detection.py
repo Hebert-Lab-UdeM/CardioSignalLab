@@ -6,13 +6,15 @@ Detects two classes of artifacts:
 2. Timestamp gaps - missing data detected via jumps in the timestamp sequence
 
 Both return sample-index ranges. Detected segments can be repaired with
-cubic spline interpolation using anchor points from clean signal on each side.
+PCHIP interpolation using anchor points from clean signal on each side.
+PCHIP (Piecewise Cubic Hermite) is monotone within each interval, preventing
+the overshoot that cubic splines produce on oscillatory PPG/ECG anchor data.
 """
 from __future__ import annotations
 
 import numpy as np
 from loguru import logger
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import PchipInterpolator
 
 from cardio_signal_lab.core.data_models import BadSegment
 from cardio_signal_lab.processing.pipeline import register_operation
@@ -243,26 +245,31 @@ def interpolate_bad_segments(
     *,
     segments: list[list[int]],
     anchor_s: float = 2.0,
+    max_interp_s: float = 3.0,
 ) -> np.ndarray:
-    """Repair bad segments with cubic spline interpolation.
+    """Repair bad segments with PCHIP interpolation.
 
     For each bad segment, selects anchor points from clean signal on both
-    sides (up to anchor_s seconds worth of samples, capped at 5 full PPG/ECG
-    cycles) and fits a cubic spline through them. The spline is evaluated
-    over the bad segment indices to produce a physiologically plausible
-    replacement.
+    sides (up to anchor_s seconds worth of samples) and fits a PCHIP
+    (Piecewise Cubic Hermite Interpolating Polynomial) through them.
+    PCHIP is monotone within each interval, preventing the overshoot that
+    cubic splines produce when anchor data is oscillatory (Elgendi 2016,
+    Orphanidou 2015).
 
-    This is the standard approach for multi-sample transient artifact repair
-    described in Orphanidou (2015) and Elgendi (2016).
+    Segments longer than max_interp_s seconds are filled with the local mean
+    instead, since no interpolation method produces physiologically meaningful
+    signal over long gaps.
 
     Args:
-        samples: Signal samples (1D array) — pipeline convention
-        sampling_rate: Sampling rate in Hz — pipeline convention
+        samples: Signal samples (1D array) -- pipeline convention
+        sampling_rate: Sampling rate in Hz -- pipeline convention
         segments: List of [start_idx, end_idx] pairs (JSON-serializable from pipeline params)
         anchor_s: Anchor region duration in seconds on each side of the bad segment (default 2.0)
+        max_interp_s: Segments longer than this (seconds) are mean-filled rather than
+            interpolated (default 3.0)
 
     Returns:
-        Signal with bad segments replaced by cubic spline interpolation
+        Signal with bad segments replaced by PCHIP interpolation or mean-fill
     """
     if not segments:
         return samples.copy()
@@ -270,6 +277,7 @@ def interpolate_bad_segments(
     n = len(samples)
     result = samples.copy()
     anchor_n = max(4, int(anchor_s * sampling_rate))
+    max_interp_n = int(max_interp_s * sampling_rate)
 
     for seg in segments:
         start_idx, end_idx = int(seg[0]), int(seg[1])
@@ -278,6 +286,9 @@ def interpolate_bad_segments(
 
         if end_idx < start_idx:
             continue
+
+        bad_indices = np.arange(start_idx, end_idx + 1)
+        seg_len = end_idx - start_idx + 1
 
         # Gather clean anchor indices from left side
         left_end = start_idx - 1
@@ -291,7 +302,6 @@ def interpolate_bad_segments(
 
         has_left = len(left_indices) >= 2
         has_right = len(right_indices) >= 2
-        bad_indices = np.arange(start_idx, end_idx + 1)
 
         if not has_left and not has_right:
             logger.warning(
@@ -300,38 +310,46 @@ def interpolate_bad_segments(
             continue
 
         if not has_left:
-            # Left edge of signal: no anchor on the left.
-            # Cubic extrapolation backward is unreliable, so fill with the
-            # mean of the right anchor region (stable baseline estimate).
             result[bad_indices] = np.mean(result[right_indices])
             logger.debug(
                 f"Left-edge bad segment [{start_idx}, {end_idx}]: "
-                f"filled with right-anchor mean ({end_idx - start_idx + 1} samples)"
+                f"filled with right-anchor mean ({seg_len} samples)"
             )
             continue
 
         if not has_right:
-            # Right edge of signal: no anchor on the right.
             result[bad_indices] = np.mean(result[left_indices])
             logger.debug(
                 f"Right-edge bad segment [{start_idx}, {end_idx}]: "
-                f"filled with left-anchor mean ({end_idx - start_idx + 1} samples)"
+                f"filled with left-anchor mean ({seg_len} samples)"
             )
             continue
 
-        # Both sides available: cubic spline through anchor points on each side
+        # Long segments: PCHIP over oscillatory data spanning many cycles produces
+        # unreliable results regardless of method, so fall back to local mean.
+        if seg_len > max_interp_n:
+            local_mean = np.mean(np.concatenate([result[left_indices], result[right_indices]]))
+            result[bad_indices] = local_mean
+            logger.warning(
+                f"Bad segment [{start_idx}, {end_idx}] ({seg_len / sampling_rate:.1f}s) "
+                f"exceeds max_interp_s={max_interp_s}s — filled with local mean"
+            )
+            continue
+
+        # Both sides available, segment short enough: PCHIP interpolation.
+        # PCHIP is monotone within each interval, preventing the overshoot that
+        # cubic splines produce on oscillatory PPG/ECG anchor data.
         anchor_indices = np.concatenate([left_indices, right_indices])
         anchor_values = result[anchor_indices]
 
         try:
-            # extrapolate=False: no extrapolation past anchor range (both sides present)
-            cs = CubicSpline(anchor_indices, anchor_values, extrapolate=False)
-            result[bad_indices] = cs(bad_indices)
+            pchip = PchipInterpolator(anchor_indices, anchor_values, extrapolate=False)
+            result[bad_indices] = pchip(bad_indices)
         except Exception as exc:
             logger.warning(f"Bad segment [{start_idx}, {end_idx}]: interpolation failed ({exc}), skipping")
             continue
 
-        logger.debug(f"Interpolated bad segment [{start_idx}, {end_idx}] ({end_idx - start_idx + 1} samples)")
+        logger.debug(f"Interpolated bad segment [{start_idx}, {end_idx}] ({seg_len} samples)")
 
     n_segs = len(segments)
     logger.info(f"Bad segment interpolation complete: {n_segs} segment(s) repaired")

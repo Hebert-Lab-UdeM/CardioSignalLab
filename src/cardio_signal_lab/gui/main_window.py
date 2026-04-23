@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from loguru import logger
 
-from cardio_signal_lab.config import get_config, get_keysequence
+from cardio_signal_lab.config import get_config, get_config_manager, get_keysequence
 from cardio_signal_lab.core import (
     BadSegment,
     get_loader,
@@ -41,6 +41,7 @@ from cardio_signal_lab.core import (
     load_events_csv,
     load_peaks_binary_csv,
 )
+from cardio_signal_lab.core.session import verify_source_checksum
 from cardio_signal_lab.gui.multi_signal_view import MultiSignalView
 from cardio_signal_lab.gui.signal_type_view import SignalTypeView
 from cardio_signal_lab.gui.single_channel_view import SingleChannelView
@@ -88,10 +89,17 @@ class MainWindow(QMainWindow):
         self._raw_samples: np.ndarray | None = None  # Baseline signal for pipeline replay
         self._current_peaks: PeakData | None = None
         self._current_bad_segments: list[BadSegment] = []
+        self._interpolated_bad_segments: list[BadSegment] = []  # Saved after interpolation for overlay toggle
+        self._show_interpolated_regions: bool = False
         self._processing_worker: ProcessingWorker | None = None
         # Structural ops (crop / resample) that have been applied directly to the
         # raw signal and cannot be replayed or reverted by the pipeline.
         self._structural_ops: list = []
+        # Write-once snapshot of the file-loaded signal, captured on first channel visit.
+        # Never overwritten by crop/resample, enabling full Reset to original state.
+        self._original_samples: np.ndarray | None = None
+        self._original_timestamps: np.ndarray | None = None
+        self._original_sampling_rate: float | None = None
 
         # Derived visualization state (active channel)
         self._eda_tonic: np.ndarray | None = None   # Tonic (SCL) component from eda_process()
@@ -100,6 +108,11 @@ class MainWindow(QMainWindow):
         # Per-channel state store: (SignalType, channel_name) -> state dict
         # Allows peaks and processing to survive navigation between channels.
         self._channel_state: dict[tuple, dict] = {}
+
+        # Session-level fields (not per-channel)
+        self._session_notes: str = ""
+        self._current_session_path: Path | None = None  # Path of last save/load .csl.json
+        self._is_dirty: bool = False  # Unsaved changes since last save/load
 
         # Window setup
         self.setWindowTitle("CardioSignalLab")
@@ -245,6 +258,40 @@ class MainWindow(QMainWindow):
         save_action.triggered.connect(self._on_file_save)
         menu.addAction(save_action)
 
+        save_as_action = QAction("Save &As...", self)
+        save_as_action.triggered.connect(self._on_file_save_as)
+        save_as_action.setEnabled(self.current_session is not None)
+        menu.addAction(save_as_action)
+
+        # Open Recent submenu
+        recent_menu = menu.addMenu("Open &Recent")
+        cfg = get_config()
+        recent_sessions = cfg.gui.recent_session_files
+        recent_sources = cfg.gui.recent_source_files
+        if recent_sessions or recent_sources:
+            if recent_sessions:
+                for p in recent_sessions:
+                    action = QAction(Path(p).name, self)
+                    action.setToolTip(p)
+                    action.triggered.connect(
+                        lambda checked, fp=p: self._open_recent(fp)
+                    )
+                    recent_menu.addAction(action)
+            if recent_sessions and recent_sources:
+                recent_menu.addSeparator()
+            if recent_sources:
+                for p in recent_sources:
+                    action = QAction(Path(p).name, self)
+                    action.setToolTip(p)
+                    action.triggered.connect(
+                        lambda checked, fp=p: self._open_recent(fp)
+                    )
+                    recent_menu.addAction(action)
+        else:
+            empty = QAction("(No recent files)", self)
+            empty.setEnabled(False)
+            recent_menu.addAction(empty)
+
         export_action = QAction("&Export...", self)
         export_action.setShortcut(get_keysequence("file_export"))
         export_action.triggered.connect(self._on_file_export)
@@ -271,6 +318,13 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
 
+        notes_action = QAction("Session &Notes...", self)
+        notes_action.triggered.connect(self._on_session_notes)
+        notes_action.setEnabled(self.current_session is not None)
+        menu.addAction(notes_action)
+
+        menu.addSeparator()
+
         exit_action = QAction("E&xit", self)
         exit_action.setShortcut(get_keysequence("file_quit"))
         exit_action.triggered.connect(self.close)
@@ -287,6 +341,16 @@ class MainWindow(QMainWindow):
         redo_action.setShortcut(get_keysequence("edit_redo"))
         redo_action.triggered.connect(self._on_edit_redo)
         menu.addAction(redo_action)
+
+        menu.addSeparator()
+
+        reviewed_action = QAction("Mark Channel as &Reviewed", self)
+        reviewed_action.setCheckable(True)
+        if self.current_signal is not None:
+            key = self._channel_key(self.current_signal)
+            reviewed_action.setChecked(self._channel_state.get(key, {}).get("reviewed", False))
+        reviewed_action.triggered.connect(self._on_toggle_reviewed)
+        menu.addAction(reviewed_action)
 
     def _add_select_menu_actions(self, menu):
         """Add Select menu actions - context-dependent on view level."""
@@ -315,7 +379,10 @@ class MainWindow(QMainWindow):
             # List channels of current signal type
             if self.signal_type_view.signals:
                 for signal in self.signal_type_view.signals:
-                    action = QAction(signal.channel_name, self)
+                    key = self._channel_key(signal)
+                    is_reviewed = self._channel_state.get(key, {}).get("reviewed", False)
+                    label = f"[R] {signal.channel_name}" if is_reviewed else signal.channel_name
+                    action = QAction(label, self)
                     action.triggered.connect(
                         lambda checked, sig=signal: self._on_channel_selected(sig)
                     )
@@ -518,6 +585,14 @@ class MainWindow(QMainWindow):
         toggle_events_action.triggered.connect(self._on_view_toggle_events)
         menu.addAction(toggle_events_action)
 
+        # Toggle interpolated segment overlay
+        toggle_interp_action = QAction("Show Interpolated Regions", self)
+        toggle_interp_action.setCheckable(True)
+        toggle_interp_action.setChecked(bool(self._interpolated_bad_segments) and self._show_interpolated_regions)
+        toggle_interp_action.setEnabled(bool(self._interpolated_bad_segments))
+        toggle_interp_action.triggered.connect(self._on_view_toggle_interpolated_regions)
+        menu.addAction(toggle_interp_action)
+
         # Toggle log panel
         toggle_log_action = QAction("Toggle Log Panel", self)
         toggle_log_action.setShortcut("L")
@@ -647,6 +722,9 @@ class MainWindow(QMainWindow):
     def _save_channel_state(self, signal: SignalData):
         """Snapshot active processing/peak state for the given channel."""
         key = self._channel_key(signal)
+        self._mark_dirty()
+        # Preserve reviewed flag if already set
+        existing = self._channel_state.get(key, {})
         self._channel_state[key] = {
             "peaks": self._current_peaks,
             "pipeline_steps": list(self.pipeline.steps),
@@ -655,6 +733,10 @@ class MainWindow(QMainWindow):
             "eda_phasic": self._eda_phasic,
             "structural_ops": list(self._structural_ops),
             "bad_segments": list(self._current_bad_segments),
+            "original_samples": self._original_samples,
+            "original_timestamps": self._original_timestamps,
+            "original_sampling_rate": self._original_sampling_rate,
+            "reviewed": existing.get("reviewed", False),
         }
         n_peaks = self._current_peaks.num_peaks if self._current_peaks else 0
         logger.debug(
@@ -696,8 +778,11 @@ class MainWindow(QMainWindow):
                 self.pipeline.steps = list(saved["pipeline_steps"])
                 self._structural_ops = list(saved.get("structural_ops", []))
                 self._current_bad_segments = list(saved.get("bad_segments", []))
+                self._original_samples = saved.get("original_samples")
+                self._original_timestamps = saved.get("original_timestamps")
+                self._original_sampling_rate = saved.get("original_sampling_rate")
             else:
-                # First visit to this channel — clean slate
+                # First visit to this channel — clean slate; capture write-once original snapshot
                 self.pipeline.reset()
                 self._raw_samples = None
                 self._current_peaks = None
@@ -705,6 +790,9 @@ class MainWindow(QMainWindow):
                 self._eda_phasic = None
                 self._structural_ops = []
                 self._current_bad_segments = []
+                self._original_samples = signal.samples.copy()
+                self._original_timestamps = signal.timestamps.copy()
+                self._original_sampling_rate = signal.sampling_rate
                 self.processing_panel.clear()
 
         # Always re-render (rebuilds LOD renderer, resets view range)
@@ -716,6 +804,10 @@ class MainWindow(QMainWindow):
 
         # Restore bad segment overlay (may be empty on first visit)
         self.single_channel_view.set_bad_segments(self._current_bad_segments, signal)
+
+        # Restore interpolated segment overlay if toggle is on
+        if self._show_interpolated_regions and self._interpolated_bad_segments:
+            self.single_channel_view.set_interpolated_segments(self._interpolated_bad_segments, signal)
 
         # Auto-show EDA derived panel when returning to a channel where decomposition was done
         if (
@@ -779,9 +871,61 @@ class MainWindow(QMainWindow):
 
     # ---- File Operations ----
 
+    def _open_recent(self, file_path: str):
+        """Open a file from the recent-files list."""
+        path = Path(file_path)
+        if not path.exists():
+            QMessageBox.warning(
+                self, "File Not Found",
+                f"The file could not be found:\n{path}\n\nIt will be removed from the recent files list."
+            )
+            cfg = get_config_manager()
+            cfg.get_config().gui.recent_source_files = [
+                p for p in cfg.get_config().gui.recent_source_files if p != file_path
+            ]
+            cfg.get_config().gui.recent_session_files = [
+                p for p in cfg.get_config().gui.recent_session_files if p != file_path
+            ]
+            cfg.save_user_config()
+            self._build_menus()
+            return
+        if path.name.endswith(".csl.json"):
+            self._load_session_file(path)
+        else:
+            if not self._confirm_discard_changes():
+                return
+            try:
+                if path.suffix.lower() == ".csv":
+                    loader = CsvLoader(signal_type=SignalType.UNKNOWN, auto_detect_type=True)
+                else:
+                    loader = get_loader(path)
+                session = loader.load(path)
+                self.current_session = session
+                self._channel_state.clear()
+                self._structural_ops.clear()
+                self._original_samples = None
+                self._original_timestamps = None
+                self._original_sampling_rate = None
+                self._session_notes = ""
+                self._current_session_path = None
+                self._mark_clean()
+                get_config_manager().add_recent_file(path, "source")
+                self._show_metadata_dialog(session)
+                self.signals.file_loaded.emit(session)
+                if self.current_view_level != "multi":
+                    self._on_return_to_multi()
+                else:
+                    self._build_menus()
+            except Exception as e:
+                logger.exception(f"Failed to open recent file: {e}")
+                QMessageBox.critical(self, "Open Error", f"Failed to open file:\n{e}")
+
     def _on_file_open(self):
         """Handle File > Open."""
         logger.info("File > Open triggered")
+
+        if not self._confirm_discard_changes():
+            return
 
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -811,6 +955,13 @@ class MainWindow(QMainWindow):
                 self.current_session = session
                 self._channel_state.clear()  # Discard per-channel state from any previous file
                 self._structural_ops.clear()
+                self._original_samples = None
+                self._original_timestamps = None
+                self._original_sampling_rate = None
+                self._session_notes = ""
+                self._current_session_path = None
+                self._mark_clean()
+                get_config_manager().add_recent_file(path, "source")
 
                 # Show warning if any streams were skipped due to corruption
                 if hasattr(loader, 'skipped_streams') and loader.skipped_streams:
@@ -864,17 +1015,66 @@ class MainWindow(QMainWindow):
 
     def _load_session_file(self, path: Path):
         """Load a .csl.json session file."""
+        if not self._confirm_discard_changes():
+            return
         try:
             session_data = load_session(path)
+
+            # Version compatibility check
+            import cardio_signal_lab as _csl_pkg
+            saved_version = session_data.get("meta", {}).get("app_version", "")
+            if saved_version:
+                def _version_tuple(v: str) -> tuple:
+                    try:
+                        return tuple(int(x) for x in v.split(".")[:3])
+                    except ValueError:
+                        return (0, 0, 0)
+                if _version_tuple(saved_version) > _version_tuple(_csl_pkg.__version__):
+                    QMessageBox.warning(
+                        self, "Session Version Mismatch",
+                        f"This session was saved by a newer version of CardioSignalLab "
+                        f"({saved_version}) than the one currently running "
+                        f"({_csl_pkg.__version__}).\n\n"
+                        f"Some features may not restore correctly."
+                    )
 
             # Load the source file
             source_path = Path(session_data["source_file"])
             if not source_path.exists():
+                # Try relative path (session file and source in the same folder)
+                relative_candidate = path.parent / source_path.name
+                if relative_candidate.exists():
+                    logger.info(
+                        f"Source file not found at original path; using relative path: "
+                        f"{relative_candidate}"
+                    )
+                    source_path = relative_candidate
+                else:
+                    reply = QMessageBox.question(
+                        self, "Source File Not Found",
+                        f"The session references a source file that could not be found:\n{source_path}\n\nWould you like to locate it manually?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    )
+                    if reply != QMessageBox.StandardButton.Yes:
+                        return
+                    located, _ = QFileDialog.getOpenFileName(
+                        self,
+                        "Locate Source File",
+                        str(source_path.parent),
+                        "Data Files (*.xdf *.csv *.mat);;All Files (*.*)",
+                    )
+                    if not located:
+                        return
+                    source_path = Path(located)
+
+            # Verify source file integrity
+            if not verify_source_checksum(source_path, session_data.get("source_file_sha256")):
                 QMessageBox.warning(
-                    self, "Source File Not Found",
-                    f"The session references a source file that no longer exists:\n{source_path}\n\nPlease locate the file manually."
+                    self, "Source File Changed",
+                    f"The source file '{source_path.name}' has changed since this session "
+                    f"was saved.\n\nPeak indices and pipeline results may no longer align "
+                    f"with the data. Proceed with caution."
                 )
-                return
 
             # Load the data file
             if source_path.suffix.lower() == ".csv":
@@ -884,23 +1084,66 @@ class MainWindow(QMainWindow):
 
             session = loader.load(source_path)
             self.current_session = session
-            self._channel_state.clear()  # Discard per-channel state from any previous file
+            self._channel_state.clear()
+            self._current_peaks = None
+            self._original_samples = None
+            self._original_timestamps = None
+            self._original_sampling_rate = None
+            self._session_notes = session_data.get("notes", "")
 
-            # Restore processing pipeline
-            pipeline_data = session_data.get("processing_pipeline", {})
-            if pipeline_data:
-                # Deserialize and apply to first signal (or user-selected signal)
-                # For now, we just log that we have pipeline data
-                logger.info(f"Session has {len(pipeline_data.get('steps', []))} processing steps")
+            # Restore per-channel state.  The session keys use string signal_type values;
+            # map them back to (SignalType, channel_name) tuples matching _channel_key().
+            signal_map = {
+                (sig.signal_type.value, sig.channel_name): sig
+                for sig in session.signals
+            }
+            restored_channels = 0
+            failed_channels: list[str] = []
+            all_skipped_ops: list[str] = []
 
-            # Restore peaks
-            peaks_data = session_data.get("peaks")
-            if peaks_data:
-                self._current_peaks = PeakData(
-                    indices=np.array(peaks_data["indices"], dtype=int),
-                    classifications=np.array(peaks_data["classifications"], dtype=int),
-                )
-                logger.info(f"Restored {self._current_peaks.num_peaks} peaks from session")
+            for (signal_type_str, channel_name), state in session_data.get("channels", {}).items():
+                sig = signal_map.get((signal_type_str, channel_name))
+                if sig is None:
+                    logger.warning(
+                        f"Session channel '{signal_type_str}|{channel_name}' not found in "
+                        f"loaded file; skipping"
+                    )
+                    continue
+
+                try:
+                    key = self._channel_key(sig)
+
+                    # Capture original samples/timestamps for this channel (needed for pipeline replay)
+                    state["original_samples"] = sig.samples.copy()
+                    state["original_timestamps"] = sig.timestamps.copy()
+                    state["original_sampling_rate"] = sig.sampling_rate
+
+                    # Replay the pipeline to produce processed samples
+                    if state["pipeline_steps"]:
+                        from cardio_signal_lab.processing.pipeline import ProcessingPipeline
+                        replay_pipeline = ProcessingPipeline()
+                        replay_pipeline.steps = list(state["pipeline_steps"])
+                        skipped = getattr(replay_pipeline, "skipped_unknown_ops", [])
+                        all_skipped_ops.extend(skipped)
+                        processed = replay_pipeline.apply(
+                            sig.samples.copy(), sig.sampling_rate, skip_on_error=True
+                        )
+                        state["raw_samples"] = processed
+                        logger.info(
+                            f"Replayed {len(replay_pipeline.steps)} pipeline step(s) for "
+                            f"'{channel_name}'"
+                        )
+
+                    self._channel_state[key] = state
+                    restored_channels += 1
+
+                except Exception as ch_err:
+                    logger.warning(
+                        f"Failed to restore channel '{channel_name}': {ch_err}; skipping"
+                    )
+                    failed_channels.append(channel_name)
+
+            logger.info(f"Restored {restored_channels} channel(s) from session")
 
             # Go to multi-signal view (rebuilds menus with session-dependent actions enabled)
             self.signals.file_loaded.emit(session)
@@ -909,9 +1152,29 @@ class MainWindow(QMainWindow):
             else:
                 self._build_menus()
 
+            total_peaks = sum(
+                state["peaks"].num_peaks
+                for state in self._channel_state.values()
+                if state.get("peaks") is not None
+            )
+            meta = session_data.get("meta", {})
+            saved_by = f"\nSaved by: {meta['operator']}" if meta.get("operator") else ""
+            saved_at = f"\nSaved at: {meta['saved_at'][:19].replace('T', ' ')} UTC" if meta.get("saved_at") else ""
+            warnings: list[str] = []
+            if failed_channels:
+                warnings.append(f"Channels not restored: {', '.join(failed_channels)}")
+            if all_skipped_ops:
+                unique_ops = sorted(set(all_skipped_ops))
+                warnings.append(f"Unknown pipeline steps skipped: {', '.join(unique_ops)}")
+            warning_text = ("\n\nWarnings:\n" + "\n".join(f"  - {w}" for w in warnings)) if warnings else ""
+            self._current_session_path = path
+            self._mark_clean()
+            get_config_manager().add_recent_file(path, "session")
             QMessageBox.information(
                 self, "Session Loaded",
-                f"Session loaded successfully.\n\nSource: {source_path.name}\nPeaks: {len(peaks_data['indices']) if peaks_data else 0}"
+                f"Session loaded successfully.\n\nSource: {source_path.name}\n"
+                f"Channels restored: {restored_channels}\nTotal peaks: {total_peaks}"
+                f"{saved_by}{saved_at}{warning_text}"
             )
 
         except Exception as e:
@@ -1059,6 +1322,9 @@ class MainWindow(QMainWindow):
         self._channel_state.clear()
         self._current_peaks = None
         self._raw_samples = None
+        self._original_samples = None
+        self._original_timestamps = None
+        self._original_sampling_rate = None
         self._eda_tonic = None
         self._eda_phasic = None
         self.pipeline.reset()
@@ -1132,42 +1398,48 @@ class MainWindow(QMainWindow):
         logger.debug(f"Session loaded: {session.num_signals} signals, {len(session.events)} events")
 
     def _on_file_save(self):
-        """Handle File > Save - save current session."""
-        logger.info("File > Save triggered")
+        """Handle File > Save.  Saves in-place if a session path is known."""
+        self._do_save(use_existing_path=True)
 
-        # Can only save if we have a session and are in channel view with processing
+    def _on_file_save_as(self):
+        """Handle File > Save As — always prompts for a new path."""
+        self._do_save(use_existing_path=False)
+
+    def _do_save(self, *, use_existing_path: bool):
+        """Core save logic, shared by Save and Save As."""
+        logger.info("Save triggered")
+
         if self.current_session is None:
             QMessageBox.warning(self, "No Session", "No session to save. Load a file first.")
             return
 
-        if self.current_signal is None:
-            QMessageBox.warning(
-                self, "No Signal",
-                "Session save is only available when viewing a single signal.\n\nSelect a signal from the multi-signal or type view first."
+        if use_existing_path and self._current_session_path is not None:
+            path = self._current_session_path
+        else:
+            default_name = self.current_session.source_path.stem + ".csl.json"
+            default_dir = (
+                self._current_session_path.parent
+                if self._current_session_path
+                else self.current_session.source_path.parent
             )
-            return
-
-        # Get save path
-        default_name = self.current_session.source_path.stem + ".csl.json"
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Session",
-            str(self.current_session.source_path.parent / default_name),
-            "Session Files (*.csl.json);;All Files (*.*)"
-        )
-
-        if not file_path:
-            return
-
-        path = Path(file_path)
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Session",
+                str(default_dir / default_name),
+                "Session Files (*.csl.json);;All Files (*.*)",
+            )
+            if not file_path:
+                return
+            path = Path(file_path)
 
         try:
-            # Serialize pipeline
-            pipeline_data = self.pipeline.serialize()
+            # Flush the active channel's live state into _channel_state before saving
+            if self.current_signal is not None:
+                self._save_channel_state(self.current_signal)
 
             # Get view state (current zoom/pan)
             view_state = {}
-            if self.current_view_level == "channel":
+            if self.current_view_level == "channel" and self.current_signal is not None:
                 plot = self.single_channel_view.plot_widget
                 x_min, x_max, y_min, y_max = plot.get_visible_range()
                 view_state = {
@@ -1177,16 +1449,23 @@ class MainWindow(QMainWindow):
                     "channel_name": self.current_signal.channel_name,
                 }
 
-            # Save session
             save_session(
                 source_file=self.current_session.source_path,
-                pipeline_data=pipeline_data,
-                peaks=self._current_peaks,
+                channel_states=self._channel_state,
                 output_path=path,
                 view_state=view_state,
+                operator_name=get_config().gui.operator_name,
+                notes=self._session_notes,
             )
 
-            self.statusBar().showMessage(f"Session saved to {path.name}", 5000)
+            self._current_session_path = path
+            self._mark_clean()
+            get_config_manager().add_recent_file(path, "session")
+
+            n_channels = len(self._channel_state)
+            self.statusBar().showMessage(
+                f"Session saved to {path.name} ({n_channels} channel(s))", 5000
+            )
             logger.info(f"Session saved to {path}")
 
         except Exception as e:
@@ -1533,6 +1812,89 @@ class MainWindow(QMainWindow):
     def _on_edit_redo(self):
         self.single_channel_view.redo()
 
+    # ------------------------------------------------------------------
+    # Dirty state
+    # ------------------------------------------------------------------
+
+    def _mark_dirty(self):
+        """Mark session as having unsaved changes."""
+        if not self._is_dirty:
+            self._is_dirty = True
+            title = self.windowTitle().rstrip(" *")
+            self.setWindowTitle(f"{title} *")
+
+    def _mark_clean(self):
+        """Clear unsaved-changes flag."""
+        self._is_dirty = False
+        title = self.windowTitle().rstrip(" *")
+        self.setWindowTitle(title)
+
+    def _confirm_discard_changes(self) -> bool:
+        """Prompt to save if dirty.  Returns True if it is safe to proceed.
+
+        Returns False if the user cancelled (work should not be discarded).
+        """
+        if not self._is_dirty:
+            return True
+        reply = QMessageBox.question(
+            self,
+            "Unsaved Changes",
+            "You have unsaved changes. Save before continuing?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+        )
+        if reply == QMessageBox.StandardButton.Save:
+            self._on_file_save()
+            # If still dirty the save was cancelled — abort the caller's action
+            return not self._is_dirty
+        if reply == QMessageBox.StandardButton.Discard:
+            return True
+        return False  # Cancel
+
+    def closeEvent(self, event):
+        if not self._confirm_discard_changes():
+            event.ignore()
+            return
+        event.accept()
+
+    def _on_toggle_reviewed(self, checked: bool):
+        """Toggle the reviewed flag for the current channel."""
+        if self.current_signal is None:
+            return
+        key = self._channel_key(self.current_signal)
+        if key not in self._channel_state:
+            self._save_channel_state(self.current_signal)
+        self._channel_state[key]["reviewed"] = checked
+        self._mark_dirty()
+        label = self.current_signal.channel_name
+        state = "reviewed" if checked else "unreviewed"
+        self.statusBar().showMessage(f"{label} marked as {state}", 3000)
+        logger.info(f"Channel '{label}' marked {state}")
+        # Rebuild menus so the checkmark reflects the new state
+        self._build_menus()
+
+    def _on_session_notes(self):
+        """Open the session notes editor dialog."""
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QTextEdit, QVBoxLayout, QLabel
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Session Notes")
+        dialog.resize(500, 300)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Notes about this recording session:"))
+        editor = QTextEdit()
+        editor.setPlainText(self._session_notes)
+        layout.addWidget(editor)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._session_notes = editor.toPlainText()
+            self._mark_dirty()
+
     @staticmethod
     def _peak_status(peak_data) -> str:
         """One-line peak breakdown for the status bar.
@@ -1554,6 +1916,7 @@ class MainWindow(QMainWindow):
     def _on_peaks_changed(self, peak_data):
         """Sync peak data from the editor back to MainWindow state."""
         self._current_peaks = peak_data
+        self._mark_dirty()
         self.signals.peaks_updated.emit(peak_data)
 
         # Show live breakdown in the status bar
@@ -2784,13 +3147,20 @@ class MainWindow(QMainWindow):
 
         self._apply_pipeline_and_update()
 
-        # Segments have been repaired — clear the overlay
+        # Segments have been repaired — save for overlay toggle, then clear active overlay
+        self._interpolated_bad_segments = list(self._current_bad_segments)
         self._current_bad_segments = []
         self.single_channel_view.clear_bad_segments()
 
+        # If the toggle is on, show the saved regions immediately
+        if self._show_interpolated_regions:
+            self.single_channel_view.set_interpolated_segments(
+                self._interpolated_bad_segments, self.current_signal
+            )
+
         n = len(segments_param)
         self.statusBar().showMessage(
-            f"Interpolated {n} bad segment(s) (cubic spline, anchor=2s)", 5000
+            f"Interpolated {n} bad segment(s) (PCHIP, anchor=2s)", 5000
         )
         logger.info(f"Interpolated {n} bad segment(s)")
         self._build_menus()
@@ -2803,39 +3173,31 @@ class MainWindow(QMainWindow):
         self._build_menus()
 
     def _on_process_reset(self):
-        """Handle Process > Reset Processing - revert to raw signal.
+        """Handle Process > Reset Processing - revert to the original file-loaded signal.
 
-        Clears all pipeline (filter) steps and restores _raw_samples.
-        Structural ops (crop, resample) are displayed as permanent and cannot
-        be reverted — the user is warned if any are present.
+        Restores samples, timestamps, and sampling rate to their state at file load,
+        undoing all structural ops (crop, resample) and pipeline filter steps.
         """
-        if self._raw_samples is None and not self._structural_ops and not self.pipeline.steps:
+        has_anything = (
+            self._original_samples is not None
+            or self._raw_samples is not None
+            or self._structural_ops
+            or self.pipeline.steps
+        )
+        if not has_anything:
             self.statusBar().showMessage("No processing to reset", 3000)
             return
 
         if self.current_signal is None:
             return
 
-        # Warn if structural ops exist — signal cannot be restored to its original
-        # pre-crop / pre-resample state because that data is no longer held in memory.
-        if self._structural_ops:
-            op_names = ", ".join(
-                ("Crop" if s.operation == "crop" else "Resample")
-                for s in self._structural_ops
-            )
-            QMessageBox.warning(
-                self,
-                "Cannot Revert Structural Operations",
-                f"The following operation(s) cannot be reverted:\n\n"
-                f"  {op_names}\n\n"
-                f"Crop and Resample change the signal length and are applied "
-                f"directly to the stored raw data.  The original signal is no "
-                f"longer held in memory.\n\n"
-                f"Reset will clear any filters applied AFTER these operations, "
-                f"reverting to the most-recent cropped/resampled state.",
-            )
-
-        if self._raw_samples is not None:
+        if self._original_samples is not None:
+            object.__setattr__(self.current_signal, "samples", self._original_samples.copy())
+            object.__setattr__(self.current_signal, "timestamps", self._original_timestamps.copy())
+            object.__setattr__(self.current_signal, "sampling_rate", self._original_sampling_rate)
+            self._raw_samples = self._original_samples.copy()
+        elif self._raw_samples is not None:
+            # Fallback for channels loaded before this feature (e.g. restored sessions)
             object.__setattr__(self.current_signal, "samples", self._raw_samples.copy())
 
         self.pipeline.reset()
@@ -2844,16 +3206,21 @@ class MainWindow(QMainWindow):
         self._eda_tonic = None
         self._eda_phasic = None
         self._current_bad_segments = []
+        self._interpolated_bad_segments = []
+        self._show_interpolated_regions = False
+        self._mark_dirty()
 
         self.single_channel_view.set_signal(self.current_signal)
         if self.current_session:
             self.single_channel_view.set_events(self.current_session.events or [])
 
+        self.single_channel_view.clear_peaks()
         self.single_channel_view.clear_derived()
         self.single_channel_view.clear_bad_segments()
+        self.single_channel_view.clear_interpolated_segments()
         self.processing_panel.clear()
-        self.statusBar().showMessage("Processing reset", 3000)
-        logger.info("Processing pipeline reset")
+        self.statusBar().showMessage("Processing reset to original signal", 3000)
+        logger.info("Processing reset to original file-loaded signal")
 
     # ---- View Operations ----
 
@@ -3030,6 +3397,19 @@ class MainWindow(QMainWindow):
         visible = view.are_events_visible()
         status = "visible" if visible else "hidden"
         self.statusBar().showMessage(f"Event markers {status}", 3000)
+
+    def _on_view_toggle_interpolated_regions(self, checked: bool):
+        """Toggle the blue overlay showing previously-interpolated bad segment locations."""
+        self._show_interpolated_regions = checked
+        if checked and self._interpolated_bad_segments:
+            self.single_channel_view.set_interpolated_segments(
+                self._interpolated_bad_segments, self.current_signal
+            )
+            n = len(self._interpolated_bad_segments)
+            self.statusBar().showMessage(f"Showing {n} interpolated region(s)", 3000)
+        else:
+            self.single_channel_view.clear_interpolated_segments()
+            self.statusBar().showMessage("Interpolated regions hidden", 3000)
 
     def _on_view_toggle_log(self):
         """Toggle log panel visibility."""

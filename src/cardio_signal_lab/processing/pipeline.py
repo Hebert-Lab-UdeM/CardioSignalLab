@@ -171,20 +171,27 @@ class ProcessingPipeline:
     def deserialize(cls, data: dict[str, Any]) -> ProcessingPipeline:
         """Reconstruct pipeline from serialized dict.
 
+        Unknown operation names are skipped with a warning rather than raising,
+        so sessions saved by older/different app versions still load partially.
+        Check `pipeline.skipped_unknown_ops` after deserialization to see what
+        was omitted.
+
         Args:
             data: Dict from serialize()
 
         Returns:
             Reconstructed ProcessingPipeline
-
-        Raises:
-            KeyError: If any operation is not registered
         """
         pipeline = cls()
+        pipeline.skipped_unknown_ops: list[str] = []
         for step_data in data.get("steps", []):
             operation = step_data["operation"]
-            # Validate operation exists
-            get_operation(operation)
+            if operation not in _OPERATIONS:
+                logger.warning(
+                    f"Pipeline deserialization: unknown operation '{operation}' — skipping"
+                )
+                pipeline.skipped_unknown_ops.append(operation)
+                continue
             step = ProcessingStep(
                 operation=operation,
                 parameters=step_data.get("parameters", {}),
@@ -192,7 +199,13 @@ class ProcessingPipeline:
             )
             pipeline.steps.append(step)
 
-        logger.info(f"Deserialized pipeline with {len(pipeline.steps)} steps")
+        if pipeline.skipped_unknown_ops:
+            logger.warning(
+                f"Deserialized pipeline skipped {len(pipeline.skipped_unknown_ops)} "
+                f"unknown operation(s): {pipeline.skipped_unknown_ops}"
+            )
+        else:
+            logger.info(f"Deserialized pipeline with {len(pipeline.steps)} steps")
         return pipeline
 
     @property

@@ -29,6 +29,7 @@ class AppStatusBar(QStatusBar):
         self.signals = get_app_signals()
         self.current_mode = "multi"
         self.num_signals = 0
+        self.filename = None
         self.selected_signal_type = None
         self.selected_signal_name = None
 
@@ -44,16 +45,17 @@ class AppStatusBar(QStatusBar):
 
     def _update_message(self):
         """Update status bar message based on current state."""
+        file_part = f" | {self.filename}" if self.filename else ""
         if self.current_mode == "multi":
             if self.num_signals > 0:
-                message = f"Multi-Signal Mode ({self.num_signals} signals loaded)"
+                message = f"Multi-Signal Mode ({self.num_signals} signals loaded){file_part}"
             else:
                 message = "Multi-Signal Mode (no file loaded)"
         else:  # single mode
             if self.selected_signal_type and self.selected_signal_name:
-                message = f"Single-Signal Mode: {self.selected_signal_type} ({self.selected_signal_name})"
+                message = f"Single-Signal Mode: {self.selected_signal_type} ({self.selected_signal_name}){file_part}"
             else:
-                message = "Single-Signal Mode"
+                message = f"Single-Signal Mode{file_part}"
 
         self.showMessage(message)
         logger.debug(f"Status bar updated: {message}")
@@ -73,8 +75,9 @@ class AppStatusBar(QStatusBar):
         Args:
             session: RecordingSession object
         """
-        # Count signals in session
         self.num_signals = len(session.signals) if hasattr(session, "signals") else 0
+        if hasattr(session, "source_path") and session.source_path:
+            self.filename = session.source_path.name
         self._update_message()
 
     def _on_signal_selected(self, signal_data):

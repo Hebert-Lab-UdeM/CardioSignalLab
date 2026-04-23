@@ -16,13 +16,17 @@ if TYPE_CHECKING:
     from cardio_signal_lab.core import BadSegment, SignalData
 
 
-# Orange shading for bad segments — clearly distinct from the red event lines
+# Orange shading for detected bad segments — clearly distinct from the red event lines
 _FILL_COLOR = QColor(255, 140, 0, 55)   # RGBA: semi-transparent amber
 _BORDER_COLOR = QColor(200, 100, 0, 130)
 
+# Blue/purple shading for interpolated segments — visually distinct from detected
+_INTERP_FILL_COLOR = QColor(80, 120, 220, 50)
+_INTERP_BORDER_COLOR = QColor(60, 90, 200, 120)
+
 
 class BadSegmentOverlay:
-    """Overlay that renders bad segments as shaded red regions on a plot.
+    """Overlay that renders bad segments as shaded regions on a plot.
 
     Usage:
         overlay = BadSegmentOverlay(plot_widget)
@@ -30,13 +34,17 @@ class BadSegmentOverlay:
         overlay.clear()
     """
 
-    def __init__(self, plot_widget):
+    def __init__(self, plot_widget, fill_color=None, border_color=None):
         """Initialize overlay.
 
         Args:
             plot_widget: SignalPlotWidget (or any pg.PlotWidget) to attach to
+            fill_color: QColor for region fill (defaults to amber for detected segments)
+            border_color: QColor for region border (defaults to dark amber)
         """
         self.plot_widget = plot_widget
+        self._fill_color = fill_color or _FILL_COLOR
+        self._border_color = border_color or _BORDER_COLOR
         self._visible = True
         self._regions: list[pg.LinearRegionItem] = []
 
@@ -74,8 +82,8 @@ class BadSegmentOverlay:
             region = pg.LinearRegionItem(
                 values=(t_start, t_end),
                 orientation="vertical",
-                brush=_FILL_COLOR,
-                pen=pg.mkPen(color=_BORDER_COLOR, width=1),
+                brush=self._fill_color,
+                pen=pg.mkPen(color=self._border_color, width=1),
                 movable=False,
             )
             region.setVisible(self._visible)
