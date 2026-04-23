@@ -83,12 +83,16 @@ class MainWindow(QMainWindow):
         self.current_signal: SignalData | None = None
         # Track whether we came from type view (for ESC navigation)
         self._came_from_type_view = False
+        self._last_open_dir: Path = Path.home()  # Remembered for open/import dialogs
+        self._last_save_dir: Path = Path.home()  # Remembered for save/export dialogs
 
         # Processing state (active channel)
         self.pipeline = ProcessingPipeline()
         self._raw_samples: np.ndarray | None = None  # Baseline signal for pipeline replay
         self._current_peaks: PeakData | None = None
         self._current_bad_segments: list[BadSegment] = []
+        self._current_gap_segments: list[BadSegment] = []  # Timestamp gaps, displayed as colored trace
+        self._show_gap_segments: bool = False
         self._interpolated_bad_segments: list[BadSegment] = []  # Saved after interpolation for overlay toggle
         self._show_interpolated_regions: bool = False
         self._processing_worker: ProcessingWorker | None = None
@@ -108,6 +112,10 @@ class MainWindow(QMainWindow):
         # Per-channel state store: (SignalType, channel_name) -> state dict
         # Allows peaks and processing to survive navigation between channels.
         self._channel_state: dict[tuple, dict] = {}
+
+        # Derived channel specs for session persistence.
+        # Each entry: {"type": "l2_norm", "signal_type": str, "source_channels": [str, ...]}
+        self._derived_channel_specs: list[dict] = []
 
         # Session-level fields (not per-channel)
         self._session_notes: str = ""
@@ -208,9 +216,15 @@ class MainWindow(QMainWindow):
         edit_menu = self.menuBar().addMenu("&Edit")
         edit_menu.setEnabled(False)
 
-        # Process menu: only show when >=2 channels (L2 Norm requires multiple channels)
+        # Process menu (always shown in type view)
+        process_menu = self.menuBar().addMenu("&Process")
+
+        crop_all_action = QAction("Crop &All Channels...", self)
+        crop_all_action.triggered.connect(self._on_type_crop_all)
+        process_menu.addAction(crop_all_action)
+
         if len(self.signal_type_view.signals) >= 2:
-            process_menu = self.menuBar().addMenu("&Process")
+            process_menu.addSeparator()
             l2_action = QAction("Create &L2 Norm Channel...", self)
             l2_action.triggered.connect(self._on_type_create_l2_norm)
             process_menu.addAction(l2_action)
@@ -247,6 +261,11 @@ class MainWindow(QMainWindow):
         open_action.setShortcut(get_keysequence("file_open"))
         open_action.triggered.connect(self._on_file_open)
         menu.addAction(open_action)
+
+        close_action = QAction("&Close File", self)
+        close_action.triggered.connect(self._on_file_close)
+        close_action.setEnabled(self.current_session is not None)
+        menu.addAction(close_action)
 
         append_action = QAction("&Append File...", self)
         append_action.triggered.connect(self._on_file_append)
@@ -426,7 +445,19 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
 
-        # --- Bad segment detection and repair ---
+        # --- Timestamp gap detection ---
+        detect_gaps_action = QAction("Detect &Timestamp Gaps...", self)
+        detect_gaps_action.triggered.connect(self._on_detect_timestamp_gaps)
+        menu.addAction(detect_gaps_action)
+
+        clear_gaps_action = QAction("Clear Timestamp &Gaps", self)
+        clear_gaps_action.triggered.connect(self._on_clear_gap_segments)
+        clear_gaps_action.setEnabled(bool(self._current_gap_segments))
+        menu.addAction(clear_gaps_action)
+
+        menu.addSeparator()
+
+        # --- Amplitude artifact detection and repair ---
         detect_bad_action = QAction("Detect &Bad Segments...", self)
         detect_bad_action.triggered.connect(self._on_detect_bad_segments)
         menu.addAction(detect_bad_action)
@@ -593,6 +624,14 @@ class MainWindow(QMainWindow):
         toggle_interp_action.triggered.connect(self._on_view_toggle_interpolated_regions)
         menu.addAction(toggle_interp_action)
 
+        # Toggle gap segment overlay (enabled after resampling detects gaps)
+        toggle_gaps_action = QAction("Display Gaps", self)
+        toggle_gaps_action.setCheckable(True)
+        toggle_gaps_action.setChecked(bool(self._current_gap_segments) and self._show_gap_segments)
+        toggle_gaps_action.setEnabled(bool(self._current_gap_segments))
+        toggle_gaps_action.triggered.connect(self._on_view_toggle_gap_segments)
+        menu.addAction(toggle_gaps_action)
+
         # Toggle log panel
         toggle_log_action = QAction("Toggle Log Panel", self)
         toggle_log_action.setShortcut("L")
@@ -705,6 +744,24 @@ class MainWindow(QMainWindow):
             self.signal_type_view.set_events(self.current_session.events or [])
 
         self.signal_type_view.set_signal_type(signal_type, signals)
+
+        # Restore derived channels from specs when the view has none
+        # (e.g., first visit after session load, or returning after viewing a different type).
+        if not self.signal_type_view.derived_signals:
+            signal_map = {s.channel_name: s for s in signals}
+            for spec in self._derived_channel_specs:
+                if spec.get("type") != "l2_norm":
+                    continue
+                if spec.get("signal_type") != signal_type.value:
+                    continue
+                source_sigs = [signal_map[ch] for ch in spec["source_channels"] if ch in signal_map]
+                if len(source_sigs) >= 2:
+                    try:
+                        self.signal_type_view.add_l2_norm(source_sigs)
+                        logger.info(f"Restored L2 Norm channel from session spec")
+                    except Exception as e:
+                        logger.warning(f"Failed to restore L2 Norm channel: {e}")
+
         self.stacked_widget.setCurrentWidget(self.signal_type_view)
         self._build_menus()
 
@@ -733,6 +790,7 @@ class MainWindow(QMainWindow):
             "eda_phasic": self._eda_phasic,
             "structural_ops": list(self._structural_ops),
             "bad_segments": list(self._current_bad_segments),
+            "gap_segments": list(self._current_gap_segments),
             "original_samples": self._original_samples,
             "original_timestamps": self._original_timestamps,
             "original_sampling_rate": self._original_sampling_rate,
@@ -778,6 +836,7 @@ class MainWindow(QMainWindow):
                 self.pipeline.steps = list(saved["pipeline_steps"])
                 self._structural_ops = list(saved.get("structural_ops", []))
                 self._current_bad_segments = list(saved.get("bad_segments", []))
+                self._current_gap_segments = list(saved.get("gap_segments", []))
                 self._original_samples = saved.get("original_samples")
                 self._original_timestamps = saved.get("original_timestamps")
                 self._original_sampling_rate = saved.get("original_sampling_rate")
@@ -790,10 +849,16 @@ class MainWindow(QMainWindow):
                 self._eda_phasic = None
                 self._structural_ops = []
                 self._current_bad_segments = []
+                self._current_gap_segments = []
+                self._show_gap_segments = False
                 self._original_samples = signal.samples.copy()
                 self._original_timestamps = signal.timestamps.copy()
                 self._original_sampling_rate = signal.sampling_rate
                 self.processing_panel.clear()
+
+        # Make the channel view visible first so setRange in set_signal operates on a
+        # widget with proper geometry (avoids deferred sigRangeChanged with stale range).
+        self.stacked_widget.setCurrentWidget(self.single_channel_view)
 
         # Always re-render (rebuilds LOD renderer, resets view range)
         self.single_channel_view.set_signal(signal)
@@ -804,6 +869,12 @@ class MainWindow(QMainWindow):
 
         # Restore bad segment overlay (may be empty on first visit)
         self.single_channel_view.set_bad_segments(self._current_bad_segments, signal)
+
+        # Restore gap segment overlay only if toggle is on
+        if self._show_gap_segments and self._current_gap_segments:
+            self.single_channel_view.set_gap_segments(self._current_gap_segments, signal)
+        else:
+            self.single_channel_view.clear_gap_segments()
 
         # Restore interpolated segment overlay if toggle is on
         if self._show_interpolated_regions and self._interpolated_bad_segments:
@@ -825,7 +896,6 @@ class MainWindow(QMainWindow):
         if self.current_session:
             self.single_channel_view.set_events(self.current_session.events or [])
 
-        self.stacked_widget.setCurrentWidget(self.single_channel_view)
         self._build_menus()
 
         n_peaks = self._current_peaks.num_peaks if self._current_peaks else 0
@@ -901,11 +971,7 @@ class MainWindow(QMainWindow):
                     loader = get_loader(path)
                 session = loader.load(path)
                 self.current_session = session
-                self._channel_state.clear()
-                self._structural_ops.clear()
-                self._original_samples = None
-                self._original_timestamps = None
-                self._original_sampling_rate = None
+                self._reset_all_channel_state()
                 self._session_notes = ""
                 self._current_session_path = None
                 self._mark_clean()
@@ -930,7 +996,7 @@ class MainWindow(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Open Physiological Signal File or Session",
-            str(Path.home()),
+            str(self._last_open_dir),
             "All Supported Files (*.xdf *.csv *.csl.json);;Session Files (*.csl.json);;Physiological Signal Files (*.xdf *.csv);;XDF Files (*.xdf);;CSV Files (*.csv);;All Files (*.*)",
         )
 
@@ -938,6 +1004,7 @@ class MainWindow(QMainWindow):
             return
 
         path = Path(file_path)
+        self._last_open_dir = path.parent
         logger.info(f"Loading file: {path}")
 
         try:
@@ -953,11 +1020,7 @@ class MainWindow(QMainWindow):
 
                 session = loader.load(path)
                 self.current_session = session
-                self._channel_state.clear()  # Discard per-channel state from any previous file
-                self._structural_ops.clear()
-                self._original_samples = None
-                self._original_timestamps = None
-                self._original_sampling_rate = None
+                self._reset_all_channel_state()
                 self._session_notes = ""
                 self._current_session_path = None
                 self._mark_clean()
@@ -1013,6 +1076,25 @@ class MainWindow(QMainWindow):
             logger.exception(f"Unexpected error loading file: {e}")
             QMessageBox.critical(self, "Error", f"An unexpected error occurred:\n{e}")
 
+    def _on_file_close(self):
+        """Close the current file and return to a clean initial state."""
+        if not self._confirm_discard_changes():
+            return
+
+        self._reset_all_channel_state()
+        self.multi_signal_view.clear()
+        self.current_session = None
+        self.current_view_level = "multi"
+        self.current_signal_type = None
+        self._came_from_type_view = False
+        self._session_notes = ""
+        self._current_session_path = None
+        self._mark_clean()
+        self.status_bar.clear()
+        self.stacked_widget.setCurrentWidget(self.multi_signal_view)
+        self._build_menus()
+        logger.info("File closed — clean slate")
+
     def _load_session_file(self, path: Path):
         """Load a .csl.json session file."""
         if not self._confirm_discard_changes():
@@ -1060,12 +1142,13 @@ class MainWindow(QMainWindow):
                     located, _ = QFileDialog.getOpenFileName(
                         self,
                         "Locate Source File",
-                        str(source_path.parent),
+                        str(self._last_open_dir),
                         "Data Files (*.xdf *.csv *.mat);;All Files (*.*)",
                     )
                     if not located:
                         return
                     source_path = Path(located)
+                    self._last_open_dir = source_path.parent
 
             # Verify source file integrity
             if not verify_source_checksum(source_path, session_data.get("source_file_sha256")):
@@ -1084,12 +1167,9 @@ class MainWindow(QMainWindow):
 
             session = loader.load(source_path)
             self.current_session = session
-            self._channel_state.clear()
-            self._current_peaks = None
-            self._original_samples = None
-            self._original_timestamps = None
-            self._original_sampling_rate = None
+            self._reset_all_channel_state()
             self._session_notes = session_data.get("notes", "")
+            self._derived_channel_specs = list(session_data.get("derived_channels", []))
 
             # Restore per-channel state.  The session keys use string signal_type values;
             # map them back to (SignalType, channel_name) tuples matching _channel_key().
@@ -1212,11 +1292,12 @@ class MainWindow(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Append Continuation File",
-            str(self.current_session.source_path.parent),
+            str(self._last_open_dir),
             "Physiological Signal Files (*.xdf *.csv);;XDF Files (*.xdf);;CSV Files (*.csv);;All Files (*.*)",
         )
         if not file_path:
             return
+        self._last_open_dir = Path(file_path).parent
 
         path = Path(file_path)
         try:
@@ -1394,6 +1475,7 @@ class MainWindow(QMainWindow):
         """Handle file_loaded signal."""
         if not self.current_session:
             self.current_session = session
+        self._last_open_dir = session.source_path.parent
         self.multi_signal_view.set_session(session)
         logger.debug(f"Session loaded: {session.num_signals} signals, {len(session.events)} events")
 
@@ -1420,7 +1502,7 @@ class MainWindow(QMainWindow):
             default_dir = (
                 self._current_session_path.parent
                 if self._current_session_path
-                else self.current_session.source_path.parent
+                else self._last_save_dir
             )
             file_path, _ = QFileDialog.getSaveFileName(
                 self,
@@ -1431,6 +1513,7 @@ class MainWindow(QMainWindow):
             if not file_path:
                 return
             path = Path(file_path)
+            self._last_save_dir = path.parent
 
         try:
             # Flush the active channel's live state into _channel_state before saving
@@ -1456,6 +1539,7 @@ class MainWindow(QMainWindow):
                 view_state=view_state,
                 operator_name=get_config().gui.operator_name,
                 notes=self._session_notes,
+                derived_channels=self._derived_channel_specs,
             )
 
             self._current_session_path = path
@@ -1555,7 +1639,7 @@ class MainWindow(QMainWindow):
             thresh_spin.setDecimals(1)
             thresh_spin.setRange(1.0, 10.0)
             thresh_spin.setSingleStep(0.5)
-            thresh_spin.setValue(3.0)
+            thresh_spin.setValue(4.0)
             thresh_spin.setToolTip("Outlier threshold in multiples of MAD from the median.")
             playout.addRow("Statistical threshold (x MAD):", thresh_spin)
 
@@ -1592,17 +1676,24 @@ class MainWindow(QMainWindow):
             file_filter = "CSV Files (*.csv);;All Files (*.*)"
             default_ext = "_annotations.csv"
 
+        channel_part = self.current_signal.channel_name.replace(" ", "_").lower()
+        source_stem = (
+            self.current_session.source_path.stem if self.current_session else ""
+        )
         default_name = (
-            self.current_signal.channel_name.replace(" ", "_").lower() + default_ext
+            f"{source_stem}_{channel_part}{default_ext}"
+            if source_stem
+            else f"{channel_part}{default_ext}"
         )
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Export Signal", default_name, file_filter
+            self, "Export Signal", str(self._last_save_dir / default_name), file_filter
         )
 
         if not file_path:
             return
 
         path = Path(file_path)
+        self._last_save_dir = path.parent
 
         try:
             if export_format == "CSV (signal + peaks)":
@@ -1678,11 +1769,12 @@ class MainWindow(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Import Events (CSV)",
-            str(self.current_session.source_path.parent),
+            str(self._last_open_dir),
             "CSV Files (*.csv);;All Files (*.*)",
         )
         if not file_path:
             return
+        self._last_open_dir = Path(file_path).parent
 
         try:
             events = load_events_csv(Path(file_path))
@@ -1758,11 +1850,12 @@ class MainWindow(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Import Corrected Peaks (CSV)",
-            str(self.current_session.source_path.parent) if self.current_session else str(Path.home()),
+            str(self._last_open_dir),
             "CSV Files (*.csv);;All Files (*.*)",
         )
         if not file_path:
             return
+        self._last_open_dir = Path(file_path).parent
 
         try:
             peak_data = load_peaks_binary_csv(
@@ -1941,6 +2034,11 @@ class MainWindow(QMainWindow):
         if self._raw_samples is None and self.current_signal is not None:
             self._raw_samples = self.current_signal.samples.copy()
 
+    def _refresh_gap_overlay(self):
+        """Re-render gap overlay using current signal samples (call after any processing step)."""
+        if self._show_gap_segments and self._current_gap_segments and self.current_signal is not None:
+            self.single_channel_view.set_gap_segments(self._current_gap_segments, self.current_signal)
+
     def _apply_pipeline_and_update(self):
         """Re-apply pipeline from raw signal and update the plot."""
         if self._raw_samples is None or self.current_signal is None:
@@ -1955,6 +2053,9 @@ class MainWindow(QMainWindow):
         self.single_channel_view.set_signal(self.current_signal)
         if self.current_session:
             self.single_channel_view.set_events(self.current_session.events or [])
+
+        # Gap overlay y-positions depend on sample values — refresh after processing
+        self._refresh_gap_overlay()
 
         self._refresh_processing_panel()
         self.statusBar().showMessage(
@@ -2291,6 +2392,7 @@ class MainWindow(QMainWindow):
             self.single_channel_view.set_signal(self.current_signal)
             if self.current_session:
                 self.single_channel_view.set_events(self.current_session.events or [])
+            self._refresh_gap_overlay()
             self._refresh_processing_panel()
             n_excl  = len(exclude_imfs)
             n_total = imfs.shape[0]
@@ -2329,6 +2431,7 @@ class MainWindow(QMainWindow):
             self.single_channel_view.set_signal(self.current_signal)
             if self.current_session:
                 self.single_channel_view.set_events(self.current_session.events or [])
+            self._refresh_gap_overlay()
             self._refresh_processing_panel()
             self.statusBar().showMessage("ECG cleaned (NeuroKit2)", 3000)
             logger.info("Applied nk.ecg_clean()")
@@ -2354,6 +2457,7 @@ class MainWindow(QMainWindow):
             self.single_channel_view.set_signal(self.current_signal)
             if self.current_session:
                 self.single_channel_view.set_events(self.current_session.events or [])
+            self._refresh_gap_overlay()
             self._refresh_processing_panel()
             self.statusBar().showMessage("PPG cleaned (NeuroKit2)", 3000)
             logger.info("Applied nk.ppg_clean()")
@@ -2379,6 +2483,7 @@ class MainWindow(QMainWindow):
             self.single_channel_view.set_signal(self.current_signal)
             if self.current_session:
                 self.single_channel_view.set_events(self.current_session.events or [])
+            self._refresh_gap_overlay()
             self._refresh_processing_panel()
             self.statusBar().showMessage("EDA cleaned (NeuroKit2)", 3000)
             logger.info("Applied nk.eda_clean()")
@@ -2452,14 +2557,8 @@ class MainWindow(QMainWindow):
     def _on_process_standard(self):
         """Run Standard Processing macro: crop -> resample 250 Hz -> NK clean -> detect peaks.
 
-        Step 1 (crop): trims to [signal_start, last_event_timestamp + 1 s].
-                       Skipped with a warning if no events are loaded.
-        Step 2 (resample): resamples to 250 Hz.  Skipped if already at 250 Hz.
-        Step 3 (NK clean): runs the signal-type-appropriate NeuroKit2 clean.
-        Step 4 (detect peaks): runs the signal-type-appropriate peak detector.
-
-        Each step records its operation in the structural ops / pipeline history
-        exactly as if the user had triggered it manually.
+        Each step delegates to the same method that the individual menu action calls,
+        so behaviour is identical to triggering each step manually.
         """
         if self.current_signal is None:
             return
@@ -2469,7 +2568,6 @@ class MainWindow(QMainWindow):
         t_start = float(timestamps[0])
         t_end_signal = float(timestamps[-1])
 
-        # --- Gather events for crop ---
         events = (self.current_session.events or []) if self.current_session else []
         has_events = bool(events)
         crop_end: float | None = None
@@ -2477,7 +2575,7 @@ class MainWindow(QMainWindow):
             last_event_t = max(ev.timestamp for ev in events)
             crop_end = min(last_event_t + 1.0, t_end_signal)
 
-        # --- Build preview text ---
+        # Build preview
         lines = []
         if has_events and crop_end is not None:
             lines.append(
@@ -2512,159 +2610,18 @@ class MainWindow(QMainWindow):
         if msg.exec() != QMessageBox.StandardButton.Ok:
             return
 
-        import scipy.signal as scipy_sig
-        import neurokit2 as nk
-        from cardio_signal_lab.core.data_models import ProcessingStep
-
         try:
-            # ------------------------------------------------------------------
-            # Step 1: Crop
-            # ------------------------------------------------------------------
             if has_events and crop_end is not None:
-                ts = self.current_signal.timestamps
-                start_idx = 0
-                end_idx = int(np.searchsorted(ts, crop_end, side="right"))
-                end_idx = max(end_idx, start_idx + 2)  # at least 2 samples
+                self._do_crop(t_start, crop_end)
 
-                source = (
-                    self._raw_samples
-                    if self._raw_samples is not None
-                    else self.current_signal.samples
-                )
-                cropped_raw = source[start_idx:end_idx]
-                cropped_ts = ts[start_idx:end_idx]
-
-                # Adjust existing peaks into the crop window
-                if self._current_peaks and self._current_peaks.num_peaks > 0:
-                    mask = (
-                        (self._current_peaks.indices >= start_idx)
-                        & (self._current_peaks.indices < end_idx)
-                    )
-                    kept_idx = self._current_peaks.indices[mask] - start_idx
-                    kept_cls = self._current_peaks.classifications[mask]
-                    self._current_peaks = (
-                        PeakData(indices=kept_idx, classifications=kept_cls)
-                        if len(kept_idx) >= 1
-                        else None
-                    )
-
-                object.__setattr__(self.current_signal, "samples", cropped_raw.copy())
-                object.__setattr__(self.current_signal, "timestamps", cropped_ts)
-                self._raw_samples = cropped_raw.copy()
-                self._eda_tonic = None
-                self._eda_phasic = None
-                self.pipeline.reset()
-
-                self._structural_ops.append(ProcessingStep(
-                    operation="crop",
-                    parameters={
-                        "start": float(cropped_ts[0]),
-                        "end": float(cropped_ts[-1]),
-                        "n_samples": len(cropped_raw),
-                    },
-                ))
-                logger.info(
-                    f"Standard Processing — crop: {cropped_ts[0]:.2f} s "
-                    f"to {cropped_ts[-1]:.2f} s ({len(cropped_raw)} samples)"
-                )
-
-            # ------------------------------------------------------------------
-            # Step 2: Resample to 250 Hz
-            # ------------------------------------------------------------------
-            current_sr = self.current_signal.sampling_rate
-            target_sr = 250.0
-            if abs(current_sr - target_sr) > 0.01:
-                source = self._raw_samples if self._raw_samples is not None else self.current_signal.samples
-                old_n = len(source)
-                new_n = int(round(old_n * target_sr / current_sr))
-                resampled_raw = scipy_sig.resample(source, new_n)
-                ts_start = float(self.current_signal.timestamps[0])
-                ts_end = float(self.current_signal.timestamps[-1])
-                new_timestamps = np.linspace(ts_start, ts_end, new_n)
-
-                # Scale peak indices proportionally
-                if self._current_peaks and self._current_peaks.num_peaks > 0:
-                    scale = new_n / old_n
-                    new_indices = np.round(
-                        self._current_peaks.indices * scale
-                    ).astype(int)
-                    new_indices = np.clip(new_indices, 0, new_n - 1)
-                    self._current_peaks = PeakData(
-                        indices=new_indices,
-                        classifications=self._current_peaks.classifications.copy(),
-                    )
-
-                object.__setattr__(self.current_signal, "samples", resampled_raw.copy())
-                object.__setattr__(self.current_signal, "timestamps", new_timestamps)
-                object.__setattr__(self.current_signal, "sampling_rate", target_sr)
-                self._raw_samples = resampled_raw.copy()
-                self.pipeline.reset()
-
-                self._structural_ops.append(ProcessingStep(
-                    operation="resample",
-                    parameters={
-                        "original_sr": current_sr,
-                        "target_sr": target_sr,
-                        "n_samples": new_n,
-                    },
-                ))
-                logger.info(
-                    f"Standard Processing — resample: {current_sr:.1f} -> {target_sr:.1f} Hz"
-                )
-
-            # ------------------------------------------------------------------
-            # Step 3: NK clean (pipeline step)
-            # ------------------------------------------------------------------
-            self._ensure_raw_backup()
-            sr_int = int(self.current_signal.sampling_rate)
+            self._do_resample(250.0)
 
             if sig_type == SignalType.ECG:
-                cleaned = nk.ecg_clean(self.current_signal.samples, sampling_rate=sr_int)
-                self.pipeline.add_step("ecg_clean", {})
-            else:  # PPG
-                cleaned = nk.ppg_clean(self.current_signal.samples, sampling_rate=sr_int)
-                self.pipeline.add_step("ppg_clean", {})
+                self._on_nk_ecg_clean()
+            else:
+                self._on_nk_ppg_clean()
 
-            object.__setattr__(self.current_signal, "samples", cleaned)
-            logger.info(f"Standard Processing — NK clean ({sig_type.value})")
-
-            # ------------------------------------------------------------------
-            # Step 4: Detect peaks
-            # ------------------------------------------------------------------
-            if sig_type == SignalType.ECG:
-                from cardio_signal_lab.processing.peak_detection import detect_ecg_peaks
-                peak_indices = detect_ecg_peaks(
-                    self.current_signal.samples, self.current_signal.sampling_rate
-                )
-                self.pipeline.add_step("detect_ecg_peaks", {})
-            else:  # PPG
-                from cardio_signal_lab.processing.peak_detection import detect_ppg_peaks
-                peak_indices = detect_ppg_peaks(
-                    self.current_signal.samples, self.current_signal.sampling_rate
-                )
-                self.pipeline.add_step("detect_ppg_peaks", {})
-
-            classifications = np.full(
-                len(peak_indices), PeakClassification.AUTO.value, dtype=int
-            )
-            self._current_peaks = PeakData(
-                indices=peak_indices.astype(int),
-                classifications=classifications,
-            )
-            logger.info(
-                f"Standard Processing — {len(peak_indices)} peaks detected"
-            )
-
-            # ------------------------------------------------------------------
-            # Refresh view
-            # ------------------------------------------------------------------
-            self._refresh_processing_panel()
-            self.single_channel_view.set_signal(self.current_signal)
-            self.single_channel_view.set_peaks(self._current_peaks)
-            if self.current_session:
-                self.single_channel_view.set_events(self.current_session.events or [])
-            self.signals.peaks_updated.emit(self._current_peaks)
-            self._build_menus()
+            self._on_process_detect_peaks()
 
             self.statusBar().showMessage(
                 f"Standard Processing complete — {self._peak_status(self._current_peaks)}", 0
@@ -2722,8 +2679,97 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Peak detection failed:\n{e}")
             self.statusBar().clearMessage()
 
+    def _do_resample(self, target_sr: float):
+        """Resample current signal to target_sr Hz. No dialog — call from handlers.
+
+        Uses pandas resample to bin samples onto a regular target-rate grid.
+        Bins spanning minor timing jitter (<=2 bins) are interpolated; bins
+        inside actual timestamp gaps remain NaN and are dropped, preserving the
+        gap structure of the original signal.
+        """
+        if self.current_signal is None:
+            return
+
+        import pandas as pd
+        from cardio_signal_lab.core.data_models import ProcessingStep
+
+        current_sr = self.current_signal.sampling_rate
+        if abs(current_sr - target_sr) < 0.01:
+            return
+
+        source = self._raw_samples if self._raw_samples is not None else self.current_signal.samples
+        source_timestamps = self.current_signal.timestamps
+
+        t_start = float(source_timestamps[0])
+        period_ms = 1000.0 / target_sr
+        period_str = f"{period_ms}ms"
+
+        td_index = pd.to_timedelta(source_timestamps - t_start, unit="s")
+        series = pd.Series(source, index=td_index)
+        resampled_series = series.resample(period_str).mean()
+        resampled_series = resampled_series.interpolate(method="linear", limit=2)
+        resampled_series = resampled_series.dropna()
+
+        resampled_raw = resampled_series.values.astype(np.float64)
+        new_timestamps = t_start + resampled_series.index.total_seconds().values
+        new_n = len(resampled_raw)
+
+        if self._current_peaks and self._current_peaks.num_peaks > 0:
+            peak_timestamps = source_timestamps[
+                np.clip(self._current_peaks.indices, 0, len(source_timestamps) - 1)
+            ]
+            new_indices = np.searchsorted(new_timestamps, peak_timestamps)
+            new_indices = np.clip(new_indices, 0, new_n - 1)
+            self._current_peaks = PeakData(
+                indices=new_indices,
+                classifications=self._current_peaks.classifications.copy(),
+            )
+
+        object.__setattr__(self.current_signal, "samples", resampled_raw.copy())
+        object.__setattr__(self.current_signal, "timestamps", new_timestamps)
+        object.__setattr__(self.current_signal, "sampling_rate", float(target_sr))
+        self._raw_samples = resampled_raw.copy()
+        self._eda_tonic = None
+        self._eda_phasic = None
+        self.pipeline.reset()
+
+        # Detect gaps in the resampled signal and store for the Display Gaps toggle.
+        # The pandas dropna preserves gap structure as timestamp jumps, so standard
+        # gap detection finds them. The limit=2 interpolation fills only tiny jitter
+        # bins, which are below the gap_multiplier threshold and won't be flagged.
+        from cardio_signal_lab.processing.bad_segment_detection import detect_timestamp_gaps
+        gap_pairs = detect_timestamp_gaps(new_timestamps, target_sr, gap_multiplier=2.0)
+        self._current_gap_segments = [
+            BadSegment(start_idx=s, end_idx=e, source="gap")
+            for s, e in gap_pairs
+        ]
+        if self._show_gap_segments and self._current_gap_segments:
+            self.single_channel_view.set_gap_segments(
+                self._current_gap_segments, self.current_signal
+            )
+        else:
+            self.single_channel_view.clear_gap_segments()
+
+        self._structural_ops.append(ProcessingStep(
+            operation="resample",
+            parameters={
+                "original_sr": current_sr,
+                "target_sr": target_sr,
+                "n_samples": new_n,
+            },
+        ))
+        self._refresh_processing_panel()
+
+        self.single_channel_view.set_signal(self.current_signal)
+        if self._current_peaks is not None:
+            self.single_channel_view.set_peaks(self._current_peaks)
+        if self.current_session:
+            self.single_channel_view.set_events(self.current_session.events or [])
+
+        logger.info(f"Signal resampled from {current_sr:.1f} to {target_sr:.1f} Hz ({new_n} samples)")
+
     def _on_process_resample(self):
-        """Handle Process > Resample — change signal sampling rate."""
+        """Handle Process > Resample — show dialog then delegate to _do_resample."""
         if self.current_signal is None:
             return
 
@@ -2763,55 +2809,58 @@ class MainWindow(QMainWindow):
         if abs(target_sr - current_sr) < 0.01:
             return
 
-        import pandas as pd
+        self._do_resample(target_sr)
+        new_n = len(self.current_signal.samples)
+        self.statusBar().showMessage(
+            f"Resampled: {current_sr:.1f} Hz -> {target_sr:.1f} Hz  ({new_n} samples)", 5000
+        )
 
-        # Resample from raw (pre-pipeline) so pipeline steps can be re-applied.
-        # Use pandas time-grid resampling + linear interpolation to match the
-        # behaviour of the original processing pipeline (mean-bin then interpolate).
-        # This produces a sample count determined by actual signal duration, not a
-        # sample-count ratio, which avoids the drift that FFT resampling introduces.
+    def _do_crop(self, crop_start: float, crop_end: float):
+        """Crop current signal to [crop_start, crop_end] seconds. No dialog — call from handlers."""
+        if self.current_signal is None:
+            return
+
+        from cardio_signal_lab.core.data_models import ProcessingStep
+
+        timestamps = self.current_signal.timestamps
+        start_idx = int(np.searchsorted(timestamps, crop_start, side="left"))
+        end_idx = int(np.searchsorted(timestamps, crop_end, side="right"))
+
         source = self._raw_samples if self._raw_samples is not None else self.current_signal.samples
-        source_timestamps = self.current_signal.timestamps
+        cropped_raw = source[start_idx:end_idx]
+        cropped_timestamps = timestamps[start_idx:end_idx]
 
-        t_start = float(source_timestamps[0])
-        period_ms = 1000.0 / target_sr
-        period_str = f"{period_ms}ms"
-
-        td_index = pd.to_timedelta(source_timestamps - t_start, unit="s")
-        series = pd.Series(source, index=td_index)
-        resampled_series = series.resample(period_str).mean().interpolate(method="linear")
-
-        resampled_raw = resampled_series.values.astype(np.float64)
-        new_timestamps = t_start + resampled_series.index.total_seconds().values
-        new_n = len(resampled_raw)
-
-        # Scale peak indices proportionally to the new sample count
         if self._current_peaks and self._current_peaks.num_peaks > 0:
-            scale = new_n / len(source)
-            new_indices = np.round(self._current_peaks.indices * scale).astype(int)
-            new_indices = np.clip(new_indices, 0, new_n - 1)
-            self._current_peaks = PeakData(
-                indices=new_indices,
-                classifications=self._current_peaks.classifications.copy(),
+            mask = (
+                (self._current_peaks.indices >= start_idx)
+                & (self._current_peaks.indices < end_idx)
             )
+            kept_indices = self._current_peaks.indices[mask] - start_idx
+            kept_cls = self._current_peaks.classifications[mask]
+            if len(kept_indices) >= 1:
+                self._current_peaks = PeakData(indices=kept_indices, classifications=kept_cls)
+                logger.info(f"Crop: kept {len(kept_indices)} peak(s)")
+            else:
+                self._current_peaks = None
+                logger.info("Crop: all peaks fell outside crop range — cleared")
 
-        # Update signal structure; reset pipeline (subsequent filters are now stale)
-        object.__setattr__(self.current_signal, "samples", resampled_raw.copy())
-        object.__setattr__(self.current_signal, "timestamps", new_timestamps)
-        object.__setattr__(self.current_signal, "sampling_rate", float(target_sr))
-        self._raw_samples = resampled_raw.copy()
+        object.__setattr__(self.current_signal, "samples", cropped_raw.copy())
+        object.__setattr__(self.current_signal, "timestamps", cropped_timestamps)
+        self._raw_samples = cropped_raw.copy()
         self._eda_tonic = None
         self._eda_phasic = None
         self.pipeline.reset()
 
-        # Record as a permanent structural op (shown in panel, warned on Reset)
-        from cardio_signal_lab.core.data_models import ProcessingStep
+        self._current_gap_segments = []
+        self._show_gap_segments = False
+        self.single_channel_view.clear_gap_segments()
+
         self._structural_ops.append(ProcessingStep(
-            operation="resample",
+            operation="crop",
             parameters={
-                "original_sr": current_sr,
-                "target_sr": target_sr,
-                "n_samples": new_n,
+                "start": crop_start,
+                "end": crop_end,
+                "n_samples": len(cropped_raw),
             },
         ))
         self._refresh_processing_panel()
@@ -2819,16 +2868,18 @@ class MainWindow(QMainWindow):
         self.single_channel_view.set_signal(self.current_signal)
         if self._current_peaks is not None:
             self.single_channel_view.set_peaks(self._current_peaks)
+        else:
+            self.single_channel_view.clear_peaks()
         if self.current_session:
             self.single_channel_view.set_events(self.current_session.events or [])
 
-        self.statusBar().showMessage(
-            f"Resampled: {current_sr:.1f} Hz -> {target_sr:.1f} Hz  ({new_n} samples)", 5000
+        logger.info(
+            f"Signal cropped: [{crop_start:.2f}, {crop_end:.2f}] s  "
+            f"({len(cropped_raw)} samples)"
         )
-        logger.info(f"Signal resampled from {current_sr:.1f} to {target_sr:.1f} Hz")
 
     def _on_process_crop(self):
-        """Handle Process > Crop — trim signal to a time range or between two events."""
+        """Handle Process > Crop — show dialog then delegate to _do_crop."""
         if self.current_signal is None:
             return
 
@@ -2914,83 +2965,88 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Too Short", "Crop range contains fewer than 2 samples.")
             return
 
-        # Crop from the raw (pre-pipeline) signal so Reset still works correctly
-        source = self._raw_samples if self._raw_samples is not None else self.current_signal.samples
-        cropped_raw = source[start_idx:end_idx]
-        cropped_timestamps = timestamps[start_idx:end_idx]
+        self._do_crop(crop_start, crop_end)
 
-        # Adjust peak indices: keep only peaks inside the crop range, re-zero indices
-        if self._current_peaks and self._current_peaks.num_peaks > 0:
-            mask = (
-                (self._current_peaks.indices >= start_idx)
-                & (self._current_peaks.indices < end_idx)
-            )
-            kept_indices = self._current_peaks.indices[mask] - start_idx
-            kept_cls = self._current_peaks.classifications[mask]
-            if len(kept_indices) >= 1:
-                self._current_peaks = PeakData(
-                    indices=kept_indices, classifications=kept_cls
-                )
-                logger.info(
-                    f"Crop: kept {len(kept_indices)} of "
-                    f"{self._current_peaks.num_peaks + int(np.sum(~mask))} peaks"
-                )
-            else:
-                self._current_peaks = None
-                logger.info("Crop: all peaks fell outside crop range — cleared")
-
-        # Update signal structure; reset pipeline (subsequent filters are now stale)
-        object.__setattr__(self.current_signal, "samples", cropped_raw.copy())
-        object.__setattr__(self.current_signal, "timestamps", cropped_timestamps)
-        self._raw_samples = cropped_raw.copy()
-        self._eda_tonic = None
-        self._eda_phasic = None
-        self.pipeline.reset()
-
-        # Record as a permanent structural op (shown in panel, warned on Reset)
-        from cardio_signal_lab.core.data_models import ProcessingStep
-        self._structural_ops.append(ProcessingStep(
-            operation="crop",
-            parameters={
-                "start": crop_start,
-                "end": crop_end,
-                "n_samples": len(cropped_raw),
-            },
-        ))
-        self._refresh_processing_panel()
-
-        self.single_channel_view.set_signal(self.current_signal)
-        if self._current_peaks is not None:
-            self.single_channel_view.set_peaks(self._current_peaks)
-        else:
-            self.single_channel_view.clear_peaks()
-        if self.current_session:
-            self.single_channel_view.set_events(self.current_session.events or [])
-
+        cropped_timestamps = self.current_signal.timestamps
         duration = float(cropped_timestamps[-1] - cropped_timestamps[0])
         self.statusBar().showMessage(
             f"Cropped to {crop_start:.2f}s - {crop_end:.2f}s  "
-            f"({duration:.2f}s, {len(cropped_raw)} samples)", 5000
-        )
-        logger.info(
-            f"Signal cropped: [{crop_start:.2f}, {crop_end:.2f}] s  "
-            f"({len(cropped_raw)} samples)"
+            f"({duration:.2f}s, {len(cropped_timestamps)} samples)", 5000
         )
 
-    def _on_detect_bad_segments(self):
-        """Handle Process > Detect Bad Segments - auto-detect amplitude and gap artifacts."""
+    def _on_detect_timestamp_gaps(self):
+        """Handle Process > Detect Timestamp Gaps — mark missing data in timestamp sequence."""
         if self.current_signal is None:
             return
 
-        from cardio_signal_lab.processing.bad_segment_detection import detect_bad_segments
+        from cardio_signal_lab.processing.bad_segment_detection import detect_timestamp_gaps
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Detect Timestamp Gaps")
+        layout = QFormLayout(dialog)
+
+        layout.addRow(QLabel(
+            "Finds places where the timestamp sequence jumps by more than\n"
+            "the expected sample interval, indicating missing data.\n"
+            "Gaps are shown as red segments on the signal trace."
+        ))
+
+        gap_spin = QDoubleSpinBox()
+        gap_spin.setDecimals(1)
+        gap_spin.setRange(1.1, 20.0)
+        gap_spin.setSingleStep(0.5)
+        gap_spin.setValue(2.0)
+        gap_spin.setToolTip("Minimum gap size as a multiple of the expected sample interval (default 2x).")
+        layout.addRow("Gap threshold (x interval):", gap_spin)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        gap_index_pairs = detect_timestamp_gaps(
+            self.current_signal.timestamps,
+            self.current_signal.sampling_rate,
+            gap_multiplier=gap_spin.value(),
+        )
+
+        self._current_gap_segments = [
+            BadSegment(start_idx=s, end_idx=e, source="gap")
+            for s, e in gap_index_pairs
+        ]
+        self.single_channel_view.set_gap_segments(self._current_gap_segments, self.current_signal)
+
+        msg = f"Found {len(self._current_gap_segments)} timestamp gap(s)"
+        self.statusBar().showMessage(msg, 5000)
+        logger.info(msg)
+        self._build_menus()
+
+    def _on_clear_gap_segments(self):
+        """Handle Process > Clear Timestamp Gaps."""
+        self._current_gap_segments = []
+        self.single_channel_view.clear_gap_segments()
+        self.statusBar().showMessage("Timestamp gaps cleared", 3000)
+        self._build_menus()
+
+    def _on_detect_bad_segments(self):
+        """Handle Process > Detect Bad Segments - auto-detect amplitude artifacts."""
+        if self.current_signal is None:
+            return
+
+        from cardio_signal_lab.processing.bad_segment_detection import detect_amplitude_artifacts
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Detect Bad Segments")
         layout = QFormLayout(dialog)
 
         layout.addRow(QLabel(
-            "Detects amplitude transients (rolling MAD) and timestamp gaps.\n"
-            "Results are shown as red shaded regions and can be repaired\n"
+            "Detects amplitude transients using a rolling MAD threshold.\n"
+            "Results are shown as amber shaded regions and can be repaired\n"
             "with Interpolate Bad Segments."
         ))
 
@@ -3018,14 +3074,6 @@ class MainWindow(QMainWindow):
         dilation_spin.setToolTip("Padding added to each side of detected regions (captures edge ringing).")
         layout.addRow("Dilation (s):", dilation_spin)
 
-        gap_spin = QDoubleSpinBox()
-        gap_spin.setDecimals(1)
-        gap_spin.setRange(1.1, 20.0)
-        gap_spin.setSingleStep(0.5)
-        gap_spin.setValue(2.0)
-        gap_spin.setToolTip("Minimum gap size as a multiple of the expected sample interval.")
-        layout.addRow("Gap threshold (x interval):", gap_spin)
-
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -3036,22 +3084,23 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        bad_segs = detect_bad_segments(
+        amp_segs = detect_amplitude_artifacts(
             self.current_signal.samples,
-            self.current_signal.timestamps,
             self.current_signal.sampling_rate,
             mad_threshold=mad_spin.value(),
             window_s=window_spin.value(),
             dilation_s=dilation_spin.value(),
-            gap_multiplier=gap_spin.value(),
         )
+
+        bad_segs = [
+            BadSegment(start_idx=s, end_idx=e, source="amplitude")
+            for s, e in amp_segs
+        ]
 
         self._current_bad_segments = bad_segs
         self.single_channel_view.set_bad_segments(bad_segs, self.current_signal)
 
-        n_amp = sum(1 for s in bad_segs if "amplitude" in s.source)
-        n_gap = sum(1 for s in bad_segs if "gap" in s.source)
-        msg = f"Found {len(bad_segs)} bad segment(s): {n_amp} amplitude, {n_gap} gap"
+        msg = f"Found {len(bad_segs)} bad segment(s) (amplitude)"
         self.statusBar().showMessage(msg, 5000)
         logger.info(msg)
 
@@ -3206,6 +3255,8 @@ class MainWindow(QMainWindow):
         self._eda_tonic = None
         self._eda_phasic = None
         self._current_bad_segments = []
+        self._current_gap_segments = []
+        self._show_gap_segments = False
         self._interpolated_bad_segments = []
         self._show_interpolated_regions = False
         self._mark_dirty()
@@ -3217,10 +3268,39 @@ class MainWindow(QMainWindow):
         self.single_channel_view.clear_peaks()
         self.single_channel_view.clear_derived()
         self.single_channel_view.clear_bad_segments()
+        self.single_channel_view.clear_gap_segments()
         self.single_channel_view.clear_interpolated_segments()
         self.processing_panel.clear()
         self.statusBar().showMessage("Processing reset to original signal", 3000)
         logger.info("Processing reset to original file-loaded signal")
+
+    def _reset_all_channel_state(self):
+        """Reset ALL per-channel processing state. Call before loading a new file."""
+        self.current_signal = None
+        self._current_peaks = None
+        self._raw_samples = None
+        self._eda_tonic = None
+        self._eda_phasic = None
+        self._current_bad_segments = []
+        self._current_gap_segments = []
+        self._show_gap_segments = False
+        self._interpolated_bad_segments = []
+        self._show_interpolated_regions = False
+        self._structural_ops = []
+        self._channel_state = {}
+        self._derived_channel_specs = []
+        self._original_samples = None
+        self._original_timestamps = None
+        self._original_sampling_rate = None
+        self.pipeline.reset()
+        self.processing_panel.clear()
+        self.signal_type_view.clear()
+        self.single_channel_view.clear()
+        self.single_channel_view.clear_peaks()
+        self.single_channel_view.clear_bad_segments()
+        self.single_channel_view.clear_gap_segments()
+        self.single_channel_view.clear_interpolated_segments()
+        self.single_channel_view.clear_derived()
 
     # ---- View Operations ----
 
@@ -3411,6 +3491,19 @@ class MainWindow(QMainWindow):
             self.single_channel_view.clear_interpolated_segments()
             self.statusBar().showMessage("Interpolated regions hidden", 3000)
 
+    def _on_view_toggle_gap_segments(self, checked: bool):
+        """Toggle the red trace overlay showing timestamp gap locations."""
+        self._show_gap_segments = checked
+        if checked and self._current_gap_segments:
+            self.single_channel_view.set_gap_segments(
+                self._current_gap_segments, self.current_signal
+            )
+            n = len(self._current_gap_segments)
+            self.statusBar().showMessage(f"Showing {n} gap location(s)", 3000)
+        else:
+            self.single_channel_view.clear_gap_segments()
+            self.statusBar().showMessage("Gap segments hidden", 3000)
+
     def _on_view_toggle_log(self):
         """Toggle log panel visibility."""
         if self.log_panel.isVisible():
@@ -3499,6 +3592,120 @@ class MainWindow(QMainWindow):
 
     # ---- Type-View Operations ----
 
+    def _on_type_crop_all(self):
+        """Crop all channels in the current session to a shared time range."""
+        if self.current_session is None or not self.current_session.signals:
+            return
+
+        signals = self.current_session.signals
+
+        # Common time range: the intersection of all channel timestamp ranges
+        t_start = max(float(s.timestamps[0]) for s in signals)
+        t_end = min(float(s.timestamps[-1]) for s in signals)
+
+        if t_start >= t_end:
+            QMessageBox.warning(self, "No Overlap", "The channels have no common time range.")
+            return
+
+        events = (self.current_session.events or []) if self.current_session else []
+        events_in_range = [ev for ev in events if t_start <= ev.timestamp <= t_end]
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Crop All Channels")
+        layout = QFormLayout(dialog)
+
+        layout.addRow(QLabel(
+            f"Crops all {len(signals)} channel(s) to the selected range.\n"
+            f"Common range: {t_start:.3f} s  to  {t_end:.3f} s"
+        ))
+
+        _MANUAL = "(manual)"
+        event_labels = [_MANUAL] + [
+            f"{ev.label}  @ {ev.timestamp:.3f} s" for ev in events_in_range
+        ]
+
+        from_combo = QComboBox()
+        from_combo.addItems(event_labels)
+        if events_in_range:
+            layout.addRow("Start from event:", from_combo)
+
+        start_spin = QDoubleSpinBox()
+        start_spin.setDecimals(3)
+        start_spin.setRange(t_start, t_end)
+        start_spin.setValue(t_start)
+        start_spin.setSuffix(" s")
+        start_spin.setSingleStep(1.0)
+        layout.addRow("Crop start:", start_spin)
+
+        to_combo = QComboBox()
+        to_combo.addItems(event_labels)
+        if events_in_range:
+            layout.addRow("End at event:", to_combo)
+
+        end_spin = QDoubleSpinBox()
+        end_spin.setDecimals(3)
+        end_spin.setRange(t_start, t_end)
+        end_spin.setValue(t_end)
+        end_spin.setSuffix(" s")
+        end_spin.setSingleStep(1.0)
+        layout.addRow("Crop end:", end_spin)
+
+        def _on_from_event(idx):
+            if idx > 0:
+                start_spin.setValue(events_in_range[idx - 1].timestamp)
+
+        def _on_to_event(idx):
+            if idx > 0:
+                end_spin.setValue(events_in_range[idx - 1].timestamp)
+
+        from_combo.currentIndexChanged.connect(_on_from_event)
+        to_combo.currentIndexChanged.connect(_on_to_event)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        crop_start = start_spin.value()
+        crop_end = end_spin.value()
+
+        if crop_start >= crop_end:
+            QMessageBox.warning(self, "Invalid Range", "Crop start must be before crop end.")
+            return
+
+        n_cropped = 0
+        for signal in signals:
+            ts = signal.timestamps
+            start_idx = int(np.searchsorted(ts, crop_start, side="left"))
+            end_idx = int(np.searchsorted(ts, crop_end, side="right"))
+            if end_idx - start_idx < 2:
+                continue
+            object.__setattr__(signal, "samples", signal.samples[start_idx:end_idx].copy())
+            object.__setattr__(signal, "timestamps", ts[start_idx:end_idx])
+            n_cropped += 1
+
+        # All per-channel state (peaks, bad segments, pipeline) is now invalid
+        self._channel_state.clear()
+        self.current_signal = None
+
+        # Refresh the type view with the cropped signals
+        if self.current_signal_type is not None:
+            self.signal_type_view.set_signal_type(
+                self.current_signal_type, self.signal_type_view.signals
+            )
+        self._mark_dirty()
+        self.statusBar().showMessage(
+            f"Cropped {n_cropped} channel(s) to {crop_start:.2f}s – {crop_end:.2f}s", 5000
+        )
+        logger.info(
+            f"Crop all: {n_cropped} channel(s) -> [{crop_start:.2f}, {crop_end:.2f}] s"
+        )
+
     def _on_type_create_l2_norm(self):
         """Handle Process > Create L2 Norm Channel from the signal-type view.
 
@@ -3547,6 +3754,12 @@ class MainWindow(QMainWindow):
 
         try:
             self.signal_type_view.add_l2_norm(selected_signals)
+            self._derived_channel_specs.append({
+                "type": "l2_norm",
+                "signal_type": self.current_signal_type.value,
+                "source_channels": [s.channel_name for s in selected_signals],
+            })
+            self._mark_dirty()
             self._build_menus()  # Refresh Select menu to include derived channel
             self.statusBar().showMessage(
                 f"L2 Norm channel created from {len(selected_signals)} channels", 5000

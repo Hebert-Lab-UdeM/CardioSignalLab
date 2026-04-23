@@ -782,9 +782,13 @@ class CsvLoader:
 
         Format:
         - Row 1: Column headers
-        - Row 2: Calibration status
+        - Row 2: Calibration status ("CAL" = calibrated physiological, "RAW" = device metadata)
         - Row 3: Units
         - Row 4+: Data
+
+        Only CAL columns are loaded as signals. RAW columns (lead-off detection,
+        status bytes such as EXG*_STA) are skipped — they are device metadata,
+        not physiological measurements.
 
         Args:
             path: Path to CSV file
@@ -792,18 +796,68 @@ class CsvLoader:
         Returns:
             RecordingSession with loaded signals
         """
+        # Read the three header rows so we can use calibration status for filtering
+        with open(path, "r") as f:
+            column_names = f.readline().strip().split(",")
+            cal_status = f.readline().strip().split(",")  # "CAL" or "RAW" per column
+
         # Load CSV skipping first 3 rows (header metadata)
         df = pd.read_csv(path, skiprows=3, header=None)
 
         if len(df) < 2:
             raise ValueError("CSV must have at least 2 data rows")
 
-        # Read header row separately to get column names
-        header_df = pd.read_csv(path, nrows=1)
-        column_names = header_df.columns.tolist()
-
         # Assign column names to data
         df.columns = column_names[:len(df.columns)]
+
+        # Build set of columns to keep: timestamp column + all CAL columns.
+        # Pad cal_status with "RAW" if it is shorter than column_names (safety).
+        cal_status_padded = list(cal_status) + ["RAW"] * (len(column_names) - len(cal_status))
+        cal_columns = {
+            column_names[i]
+            for i, status in enumerate(cal_status_padded)
+            if status.strip().upper() == "CAL"
+        }
+        raw_skipped = [
+            column_names[i]
+            for i, status in enumerate(cal_status_padded[1:], start=1)
+            if status.strip().upper() != "CAL"
+        ]
+        if raw_skipped:
+            logger.info(
+                f"Shimmer CSV: skipping {len(raw_skipped)} RAW column(s) "
+                f"(lead-off / status): {raw_skipped}"
+            )
+
+        # Drop rows where the EXG device status columns indicate abnormal state.
+        #
+        # Shimmer EXG recordings interleave multiple packet types in the same CSV.
+        # Rows from non-ECG packets (e.g. lead-off detection bursts, Bluetooth
+        # handshake packets) have EXG status bytes that differ from the dominant
+        # recording state. These rows contain garbage ADC values and can have
+        # timestamps far outside the main recording window, creating spurious gaps.
+        #
+        # Strategy: keep only rows whose EXG status columns match the mode (most
+        # common value). This preserves normal recording rows regardless of the
+        # exact status code used by a specific Shimmer firmware version.
+        exg_status_cols = [
+            column_names[i]
+            for i, status in enumerate(cal_status_padded)
+            if status.strip().upper() == "RAW" and "sta" in column_names[i].lower()
+        ]
+        present_status = [c for c in exg_status_cols if c in df.columns]
+        if present_status:
+            # Build a composite status key and keep only rows matching the mode
+            status_key = df[present_status].astype(str).agg(",".join, axis=1)
+            mode_key = status_key.mode().iloc[0]
+            status_mask = status_key != mode_key
+            n_dropped = int(status_mask.sum())
+            if n_dropped:
+                df = df[~status_mask].reset_index(drop=True)
+                logger.info(
+                    f"Shimmer CSV: dropped {n_dropped} row(s) with non-standard EXG "
+                    f"status (lead-off / handshake packets) — {len(df)} rows remain"
+                )
 
         # First column is time (in milliseconds for Shimmer)
         time_col = df.columns[0]
@@ -815,7 +869,7 @@ class CsvLoader:
         # Align to start at time 0
         timestamps = timestamps - timestamps[0]
 
-        # Validate timestamps
+        # Validate timestamps are monotonically increasing
         time_diffs = np.diff(timestamps)
         if not np.all(time_diffs > 0):
             non_monotonic_indices = np.where(time_diffs <= 0)[0]
@@ -840,9 +894,13 @@ class CsvLoader:
 
         logger.info(f"Detected sampling rate: {sampling_rate:.2f} Hz (timestamps aligned to t=0)")
 
-        # Create signals from remaining columns
+        # Create signals from CAL columns only (skip timestamp column and all RAW columns)
         signals = []
         for col_name in df.columns[1:]:
+            # Skip RAW columns (lead-off detection, status bytes, etc.)
+            if col_name not in cal_columns:
+                continue
+
             samples = df[col_name].values.astype(np.float64)
 
             # Skip empty columns

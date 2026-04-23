@@ -114,6 +114,7 @@ def save_session(
     view_state: dict[str, Any] | None = None,
     operator_name: str = "",
     notes: str = "",
+    derived_channels: list[dict] | None = None,
 ) -> Path:
     """Save session to JSON file for resuming work.
 
@@ -151,6 +152,7 @@ def save_session(
         "source_file_sha256": checksum,
         "notes": notes,
         "channels": channels,
+        "derived_channels": derived_channels or [],
         "view_state": view_state or {},
     }
 
@@ -199,6 +201,7 @@ def load_session(session_path: Path | str) -> dict[str, Any]:
         "source_file_sha256": raw.get("source_file_sha256"),
         "notes": raw.get("notes", ""),
         "channels": channels,
+        "derived_channels": raw.get("derived_channels", []),
         "view_state": raw.get("view_state", {}),
     }
 

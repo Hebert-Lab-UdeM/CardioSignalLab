@@ -235,25 +235,34 @@ class SignalPlotWidget(pg.PlotWidget):
         if self.lod_renderer is None or self.plot_curve is None:
             return
 
+        # Degenerate range (can happen when widget is hidden or during init)
+        if x_min >= x_max:
+            return
+
         # Get plot widget width in pixels
         pixel_width = self.plotItem.getViewBox().width()
         if pixel_width <= 0:
             pixel_width = 800  # Default fallback
 
-        # Get render data from LOD renderer
-        t_data, s_data = self.lod_renderer.get_render_data(x_min, x_max, int(pixel_width))
+        # get_render_data raises ValueError when range is invalid; guard so Qt
+        # signal handling doesn't silently swallow the exception and leave the
+        # curve in a cleared state.
+        try:
+            t_data, s_data = self.lod_renderer.get_render_data(x_min, x_max, int(pixel_width))
+        except (ValueError, IndexError):
+            return
 
-        # Update plot curve
+        # Only update when there is data; never call setData([], []) here —
+        # that would clear the initial data painted by set_signal if a stale
+        # range fires before the widget has been properly laid out.
         if len(t_data) > 0:
             self.plot_curve.setData(t_data, s_data)
-        else:
-            # Empty data - clear plot
-            self.plot_curve.setData([], [])
 
     def clear(self):
         """Clear plot and reset to empty state."""
         if self.plot_curve is not None:
-            self.plot_curve.setData([], [])
+            self.plotItem.removeItem(self.plot_curve)
+            self.plot_curve = None
 
         self.signal_data = None
         self.lod_renderer = None

@@ -79,10 +79,10 @@ def compute_heart_rate(
     bpm = 60.0 / rr
     mid_times = (peak_times[:-1] + peak_times[1:]) / 2.0
 
-    # Rolling average with a centred window (mode='same' pads edges)
+    # Rolling average with edge replication to avoid zero-pad dip at boundaries
+    from scipy.ndimage import uniform_filter1d
     w = min(rolling_window, len(bpm))
-    kernel = np.ones(w) / w
-    rolling_bpm = np.convolve(bpm, kernel, mode="same")
+    rolling_bpm = uniform_filter1d(bpm, size=w, mode="nearest")
 
     logger.debug(
         f"compute_heart_rate: {len(bpm)} intervals, "

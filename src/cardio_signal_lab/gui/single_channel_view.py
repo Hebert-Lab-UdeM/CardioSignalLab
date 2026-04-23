@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QSplitter, QVBoxLayout, QWidget
 from cardio_signal_lab.core import PeakClassification, PeakData
 from cardio_signal_lab.gui.bad_segment_overlay import (
     BadSegmentOverlay,
+    GapSegmentOverlay,
     _INTERP_FILL_COLOR,
     _INTERP_BORDER_COLOR,
 )
@@ -54,6 +55,7 @@ class SingleChannelView(QWidget):
         self.event_overlay: EventOverlay | None = None
         self.bad_segment_overlay: BadSegmentOverlay | None = None
         self.interpolated_segment_overlay: BadSegmentOverlay | None = None
+        self.gap_overlay: GapSegmentOverlay | None = None
 
         # Accept keyboard focus so keyPressEvent fires
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -82,6 +84,7 @@ class SingleChannelView(QWidget):
             fill_color=_INTERP_FILL_COLOR,
             border_color=_INTERP_BORDER_COLOR,
         )
+        self.gap_overlay = GapSegmentOverlay(self.plot_widget)
 
         # Connect scene-level mouse clicks (double-click to add peaks)
         self.plot_widget.scene().sigMouseClicked.connect(self._on_scene_clicked)
@@ -347,6 +350,18 @@ class SingleChannelView(QWidget):
         """Remove interpolated segment overlay."""
         if self.interpolated_segment_overlay is not None:
             self.interpolated_segment_overlay.clear()
+
+    def set_gap_segments(self, gap_segments: list, signal=None):
+        """Render timestamp gaps as red colored trace lines."""
+        sig = signal or self.signal_data
+        if sig is None or self.gap_overlay is None:
+            return
+        self.gap_overlay.set_gap_segments(gap_segments, sig)
+
+    def clear_gap_segments(self):
+        """Remove gap segment overlay."""
+        if self.gap_overlay is not None:
+            self.gap_overlay.clear()
 
     # ---- Events Display ----
 

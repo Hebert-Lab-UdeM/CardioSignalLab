@@ -80,6 +80,15 @@ class AppStatusBar(QStatusBar):
             self.filename = session.source_path.name
         self._update_message()
 
+    def clear(self):
+        """Reset to no-file-loaded state."""
+        self.num_signals = 0
+        self.filename = None
+        self.selected_signal_type = None
+        self.selected_signal_name = None
+        self.current_mode = "multi"
+        self._update_message()
+
     def _on_signal_selected(self, signal_data):
         """Handle signal selected signal.
 
