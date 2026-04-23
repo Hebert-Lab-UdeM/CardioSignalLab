@@ -126,18 +126,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CardioSignalLab")
         self.resize(self.config.gui.window_width, self.config.gui.window_height)
 
-        # Create views
-        self.multi_signal_view = MultiSignalView()
-        self.signal_type_view = SignalTypeView()
-        self.single_channel_view = SingleChannelView()
-
-        # Create stacked widget
+        # Create stacked widget (container persists; views inside are rebuilt on file close)
         self.stacked_widget = QStackedWidget()
-        self.stacked_widget.addWidget(self.multi_signal_view)   # Index 0
-        self.stacked_widget.addWidget(self.signal_type_view)    # Index 1
-        self.stacked_widget.addWidget(self.single_channel_view) # Index 2
         self.setCentralWidget(self.stacked_widget)
-        self.stacked_widget.setCurrentWidget(self.multi_signal_view)
+
+        # Create the three views and wire their signals
+        self._create_views()
 
         # Status bar
         self.status_bar = AppStatusBar(self)
@@ -164,19 +158,44 @@ class MainWindow(QMainWindow):
         # Build initial menus
         self._build_menus()
 
-        # Connect view signals
-        self.multi_signal_view.signal_type_selected.connect(self._on_signal_type_selected)
-        self.signal_type_view.channel_selected.connect(self._on_channel_selected)
-        self.single_channel_view.return_to_multi_requested.connect(self._on_return_to_multi)
-        self.single_channel_view.peaks_changed.connect(self._on_peaks_changed)
-
-        # Connect app signals
+        # Connect app signals (these survive view rebuilds)
         self.signals.mode_changed.connect(self._on_mode_changed)
         self.signals.file_loaded.connect(self._on_file_loaded_signal)
 
         logger.info("MainWindow initialized with 3-level view hierarchy")
 
     # ---- Menu Building ----
+
+    def _create_views(self):
+        """Create the three view widgets and add them to the stacked widget."""
+        self.multi_signal_view = MultiSignalView()
+        self.signal_type_view = SignalTypeView()
+        self.single_channel_view = SingleChannelView()
+
+        self.stacked_widget.addWidget(self.multi_signal_view)   # Index 0
+        self.stacked_widget.addWidget(self.signal_type_view)    # Index 1
+        self.stacked_widget.addWidget(self.single_channel_view) # Index 2
+        self.stacked_widget.setCurrentWidget(self.multi_signal_view)
+
+        # Connect view signals
+        self.multi_signal_view.signal_type_selected.connect(self._on_signal_type_selected)
+        self.signal_type_view.channel_selected.connect(self._on_channel_selected)
+        self.single_channel_view.return_to_multi_requested.connect(self._on_return_to_multi)
+        self.single_channel_view.peaks_changed.connect(self._on_peaks_changed)
+
+        logger.debug("Views created")
+
+    def _destroy_views(self):
+        """Remove and destroy all three view widgets from the stacked widget."""
+        for view in (self.single_channel_view, self.signal_type_view, self.multi_signal_view):
+            self.stacked_widget.removeWidget(view)
+            view.deleteLater()
+        logger.debug("Views destroyed")
+
+    def _rebuild_views(self):
+        """Destroy and recreate all views. Used on file close to guarantee clean state."""
+        self._destroy_views()
+        self._create_views()
 
     def _build_menus(self):
         """Build menu bar based on current view level."""
@@ -972,16 +991,15 @@ class MainWindow(QMainWindow):
                 session = loader.load(path)
                 self.current_session = session
                 self._reset_all_channel_state()
+                self._rebuild_views()
+                self.current_view_level = "multi"
                 self._session_notes = ""
                 self._current_session_path = None
                 self._mark_clean()
                 get_config_manager().add_recent_file(path, "source")
                 self._show_metadata_dialog(session)
                 self.signals.file_loaded.emit(session)
-                if self.current_view_level != "multi":
-                    self._on_return_to_multi()
-                else:
-                    self._build_menus()
+                self._build_menus()
             except Exception as e:
                 logger.exception(f"Failed to open recent file: {e}")
                 QMessageBox.critical(self, "Open Error", f"Failed to open file:\n{e}")
@@ -1021,6 +1039,8 @@ class MainWindow(QMainWindow):
                 session = loader.load(path)
                 self.current_session = session
                 self._reset_all_channel_state()
+                self._rebuild_views()
+                self.current_view_level = "multi"
                 self._session_notes = ""
                 self._current_session_path = None
                 self._mark_clean()
@@ -1040,12 +1060,7 @@ class MainWindow(QMainWindow):
 
                 self._show_metadata_dialog(session)
                 self.signals.file_loaded.emit(session)
-
-                # Go to multi-signal view (rebuilds menus with session-dependent actions enabled)
-                if self.current_view_level != "multi":
-                    self._on_return_to_multi()
-                else:
-                    self._build_menus()  # Already in multi view — still need to re-enable actions
+                self._build_menus()
 
                 logger.info(f"File loaded: {session.num_signals} signals")
 
@@ -1077,12 +1092,16 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"An unexpected error occurred:\n{e}")
 
     def _on_file_close(self):
-        """Close the current file and return to a clean initial state."""
+        """Close the current file and return to a clean initial state.
+
+        Destroys and recreates all view widgets so that PyQtGraph scene state
+        is guaranteed clean -- no stale PlotDataItems or detached ViewBox items.
+        """
         if not self._confirm_discard_changes():
             return
 
         self._reset_all_channel_state()
-        self.multi_signal_view.clear()
+        self._rebuild_views()
         self.current_session = None
         self.current_view_level = "multi"
         self.current_signal_type = None
@@ -1091,7 +1110,7 @@ class MainWindow(QMainWindow):
         self._current_session_path = None
         self._mark_clean()
         self.status_bar.clear()
-        self.stacked_widget.setCurrentWidget(self.multi_signal_view)
+        self.processing_panel.clear()
         self._build_menus()
         logger.info("File closed — clean slate")
 
@@ -1168,6 +1187,8 @@ class MainWindow(QMainWindow):
             session = loader.load(source_path)
             self.current_session = session
             self._reset_all_channel_state()
+            self._rebuild_views()
+            self.current_view_level = "multi"
             self._session_notes = session_data.get("notes", "")
             self._derived_channel_specs = list(session_data.get("derived_channels", []))
 
@@ -1225,12 +1246,9 @@ class MainWindow(QMainWindow):
 
             logger.info(f"Restored {restored_channels} channel(s) from session")
 
-            # Go to multi-signal view (rebuilds menus with session-dependent actions enabled)
+            # Populate the multi-signal view and rebuild menus
             self.signals.file_loaded.emit(session)
-            if self.current_view_level != "multi":
-                self._on_return_to_multi()
-            else:
-                self._build_menus()
+            self._build_menus()
 
             total_peaks = sum(
                 state["peaks"].num_peaks
@@ -3293,14 +3311,6 @@ class MainWindow(QMainWindow):
         self._original_timestamps = None
         self._original_sampling_rate = None
         self.pipeline.reset()
-        self.processing_panel.clear()
-        self.signal_type_view.clear()
-        self.single_channel_view.clear()
-        self.single_channel_view.clear_peaks()
-        self.single_channel_view.clear_bad_segments()
-        self.single_channel_view.clear_gap_segments()
-        self.single_channel_view.clear_interpolated_segments()
-        self.single_channel_view.clear_derived()
 
     # ---- View Operations ----
 

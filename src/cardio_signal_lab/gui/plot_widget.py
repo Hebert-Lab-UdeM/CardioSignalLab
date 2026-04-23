@@ -127,16 +127,11 @@ class SignalPlotWidget(pg.PlotWidget):
             # Get initial render data (use reasonable pixel width estimate)
             t_data, s_data = self.lod_renderer.get_render_data(x_min, x_max, 1000)
 
-            # Create plot curve with data
+            # Create plot curve (always fresh — widget is rebuilt between file loads)
             pen = pg.mkPen(color=color, width=1)
-            if self.plot_curve is None:
-                self.plot_curve = self.plotItem.plot(
-                    t_data, s_data,
-                    pen=pen
-                )
-            else:
-                self.plot_curve.setPen(pen)
-                self.plot_curve.setData(t_data, s_data)
+            if self.plot_curve is not None:
+                self.plotItem.removeItem(self.plot_curve)
+            self.plot_curve = self.plotItem.plot(t_data, s_data, pen=pen)
 
             # Disable auto-range to prevent feedback loops
             self.plotItem.disableAutoRange()
@@ -259,21 +254,17 @@ class SignalPlotWidget(pg.PlotWidget):
             self.plot_curve.setData(t_data, s_data)
 
     def clear(self):
-        """Clear plot and reset to empty state."""
+        """Clear plot data and reset to empty state."""
         if self.plot_curve is not None:
             self.plotItem.removeItem(self.plot_curve)
             self.plot_curve = None
-
         self.signal_data = None
         self.lod_renderer = None
-
         self.plotItem.setTitle("")
-
-        logger.debug("SignalPlotWidget cleared")
 
     def reset_view(self):
         """Reset view to show full signal range."""
-        if self.lod_renderer is None:
+        if self.lod_renderer is None or self.plot_curve is None:
             return
 
         x_min, x_max, y_min, y_max = self.lod_renderer.get_full_range()
@@ -314,28 +305,18 @@ class SignalPlotWidget(pg.PlotWidget):
         vb = self.plotItem.getViewBox()
         logger.info(f"ViewBox: {vb}, visible: {vb.isVisible()}, size: {vb.width()}x{vb.height()}")
 
-        # Test 1: Try adding InfiniteLine directly to ViewBox
-        logger.info("TEST 1: Adding InfiniteLine directly to ViewBox...")
-        line = pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen('green', width=5))
-        vb.addItem(line)
-        logger.info(f"InfiniteLine added to ViewBox: {line}, visible: {line.isVisible()}, scene: {line.scene()}")
-
-        # Test 2: Try PlotDataItem directly to ViewBox
-        logger.info("TEST 2: Creating PlotDataItem and adding to ViewBox...")
-        curve = pg.PlotDataItem(
+        # Test: PlotDataItem via plotItem.plot
+        logger.info("Creating PlotDataItem via plotItem.plot...")
+        self.plot_curve = self.plotItem.plot(
             t, s,
             pen=pg.mkPen(color='red', width=5),
-            name='test_curve'
         )
-        vb.addItem(curve)
-        self.plot_curve = curve
 
-        logger.info(f"PlotDataItem added to ViewBox: {curve}")
-        logger.info(f"  visible: {curve.isVisible()}")
-        logger.info(f"  in scene: {curve.scene() is not None}")
-        logger.info(f"  data points: {len(curve.xData) if curve.xData is not None else 0}")
+        logger.info(f"PlotDataItem: {self.plot_curve}")
+        logger.info(f"  visible: {self.plot_curve.isVisible()}")
+        logger.info(f"  in scene: {self.plot_curve.scene() is not None}")
 
-        # Test 3: Check all items in ViewBox
+        # Check all items in ViewBox
         all_items = vb.allChildren()
         logger.info(f"All items in ViewBox: {len(all_items)} items")
         for i, item in enumerate(all_items[:10]):  # Log first 10
