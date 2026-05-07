@@ -1,4 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
+import sys
+
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 # NeuroKit2 ships data files (signal templates, sample datasets) - bundle everything.
@@ -70,3 +72,19 @@ coll = COLLECT(
     upx_exclude=[],
     name='CardioSignalLab',
 )
+
+# On macOS, wrap the COLLECT output in a proper .app bundle so users can
+# drag-and-drop to /Applications. No-op on Windows/Linux.
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        coll,
+        name='CardioSignalLab.app',
+        icon=None,
+        bundle_identifier='com.hebertlab.cardiosignallab',
+        info_plist={
+            'NSHighResolutionCapable': True,
+            'NSPrincipalClass': 'NSApplication',
+            'CFBundleShortVersionString': '0.1.0',
+            'CFBundleVersion': '0.1.0',
+        },
+    )
