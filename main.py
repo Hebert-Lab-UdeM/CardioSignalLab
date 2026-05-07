@@ -14,8 +14,10 @@ def _user_log_dir() -> Path:
     """Per-user writable directory for log files (install dir may be read-only)."""
     if sys.platform == "win32":
         base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-    else:
-        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+        return base / "CardioSignalLab" / "logs"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Logs" / "CardioSignalLab"
+    base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
     return base / "CardioSignalLab" / "logs"
 
 
