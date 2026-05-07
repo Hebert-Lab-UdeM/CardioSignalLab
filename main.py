@@ -2,11 +2,25 @@
 
 Desktop application for viewing, processing, and correcting physiological signals.
 """
+import os
 import sys
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 from loguru import logger
+
+
+def _user_log_dir() -> Path:
+    """Per-user writable directory for log files (install dir may be read-only)."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    return base / "CardioSignalLab" / "logs"
+
+
+_log_path = _user_log_dir() / "cardio_signal_lab.log"
+_log_path.parent.mkdir(parents=True, exist_ok=True)
 
 # Configure logger
 logger.remove()  # Remove default handler
@@ -18,7 +32,7 @@ if sys.stderr is not None:
         level="INFO",
     )
 logger.add(
-    "cardio_signal_lab.log",
+    _log_path,
     rotation="10 MB",
     retention="7 days",
     level="DEBUG",
