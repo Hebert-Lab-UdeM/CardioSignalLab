@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# CardioSignalLauncher — macOS .app entry point
+#
+# Launches CardioSignalLab without showing a Terminal window.
+# stdout/stderr are redirected to ~/Library/Logs/CardioSignalLab/launcher.log.
+#
+# Tries, in order:
+#   1. The installed `cardio-signal-lab` console script (pip install)
+#   2. A conda environment named `cardio-signal-lab`
+#   3. A venv at ~/venv
+
+set -eu
+
+LAUNCHER_LOG="$HOME/Library/Logs/CardioSignalLab/launcher.log"
+mkdir -p "$(dirname "$LAUNCHER_LOG")"
+
+exec > "$LAUNCHER_LOG" 2>&1
+
+CONDA_ENV="cardio-signal-lab"
+
+if command -v cardio-signal-lab >/dev/null 2>&1; then
+    exec cardio-signal-lab
+fi
+
+for CONDA_BASE in "$HOME/miniconda3" "$HOME/Miniconda3" "$HOME/anaconda3" "$HOME/Anaconda3" "/opt/miniconda3" "/opt/anaconda3" "/opt/homebrew/Caskroom/miniconda/base"; do
+    if [ -f "$CONDA_BASE/envs/$CONDA_ENV/bin/python" ]; then
+        exec "$CONDA_BASE/envs/$CONDA_ENV/bin/python" -m cardio_signal_lab.app
+    fi
+done
+
+if [ -f "$HOME/venv/bin/python" ]; then
+    exec "$HOME/venv/bin/python" -m cardio_signal_lab.app
+fi
+
+osascript -e 'tell app "System Events" to display dialog "CardioSignalLab could not be launched.
+
+Make sure the application is installed and the \"cardio-signal-lab\" conda environment or a pip install exists.
+
+See ~/Library/Logs/CardioSignalLab/launcher.log for details." with title "CardioSignalLab" buttons {"OK"} default button 1 with icon stop'
+
+exit 1

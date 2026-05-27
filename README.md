@@ -21,7 +21,7 @@ Desktop application for viewing, processing, and correcting physiological signal
 
 ### For colleagues (no git required)
 
-If you have Anaconda or Miniconda, run these in your terminal:
+**macOS / Linux** -- run these in a terminal:
 
 ```
 conda create -n cardio-signal-lab python=3.12
@@ -29,9 +29,23 @@ conda activate cardio-signal-lab
 pip install https://github.com/SDevrajK/CardioSignalLab/archive/refs/heads/main.zip
 ```
 
-Then double-click `CardioSignalLab.bat` (download it from the repo) to launch the app.
+Then launch with `./CardioSignalLab.sh` (download the script from the repo).
 
-To update to the latest version:
+**macOS only** -- `CardioSignalLab.app` is also included in the repo. After installing
+(download zip or git clone), double-click `CardioSignalLab.app` in Finder to launch
+with no Terminal window visible.
+
+**Windows** -- run these in Anaconda Prompt:
+
+```
+conda create -n cardio-signal-lab python=3.12
+conda activate cardio-signal-lab
+pip install https://github.com/SDevrajK/CardioSignalLab/archive/refs/heads/main.zip
+```
+
+Then double-click `CardioSignalLab.bat` (download it from the repo) to launch.
+
+To update to the latest version (all platforms):
 
 ```
 conda activate cardio-signal-lab
@@ -54,21 +68,39 @@ pip install -e .
 cardio-signal-lab
 ```
 
+Or use the provided launcher script:
+
+```
+./CardioSignalLab.sh          # macOS / Linux (terminal)
+CardioSignalLab.app           # macOS (double-click in Finder, no terminal)
+CardioSignalLab.bat           # Windows (double-click)
+```
+
 ### Using a virtual environment (recommended)
 
 If you prefer to keep dependencies isolated from your base Python:
 
 ```
-python -m venv venv
-
-# Windows
-venv\Scripts\activate
+python3 -m venv venv
 
 # macOS / Linux
 source venv/bin/activate
 
+# Windows
+venv\Scripts\activate
+
 pip install -e .
 cardio-signal-lab
+```
+
+Or install with Homebrew on macOS:
+
+```
+brew install python@3.12
+python3 -m venv venv
+source venv/bin/activate
+pip install https://github.com/SDevrajK/CardioSignalLab/archive/refs/heads/main.zip
+./CardioSignalLab.sh
 ```
 
 ### Using conda
