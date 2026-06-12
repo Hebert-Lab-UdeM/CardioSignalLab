@@ -21,7 +21,7 @@ Desktop application for viewing, processing, and correcting physiological signal
 
 ### For colleagues (no git required)
 
-**macOS / Linux** -- run these in a terminal:
+**macOS** -- run these in a terminal **once** to install dependencies:
 
 ```
 conda create -n cardio-signal-lab python=3.12
@@ -29,11 +29,13 @@ conda activate cardio-signal-lab
 pip install https://github.com/SDevrajK/CardioSignalLab/archive/refs/heads/main.zip
 ```
 
-Then launch with `./CardioSignalLab.sh` (download the script from the repo).
+After that, find `CardioSignalLab.app` in the downloaded folder and **double-click it
+in Finder** to launch -- no Terminal window needed. (The `.app` is included in the repo
+and ships inside the zip download.)
 
-**macOS only** -- `CardioSignalLab.app` is also included in the repo. After installing
-(download zip or git clone), double-click `CardioSignalLab.app` in Finder to launch
-with no Terminal window visible.
+Alternatively, launch from Terminal with `./CardioSignalLab.sh` (also in the zip).
+
+**Linux** -- run the same install commands, then launch with `./CardioSignalLab.sh`.
 
 **Windows** -- run these in Anaconda Prompt:
 
@@ -68,12 +70,12 @@ pip install -e .
 cardio-signal-lab
 ```
 
-Or use the provided launcher script:
+Or use the provided launcher:
 
 ```
-./CardioSignalLab.sh          # macOS / Linux (terminal)
-CardioSignalLab.app           # macOS (double-click in Finder, no terminal)
-CardioSignalLab.bat           # Windows (double-click)
+CardioSignalLab.app           # macOS: double-click in Finder (no terminal)
+./CardioSignalLab.sh          # macOS / Linux: run from Terminal
+CardioSignalLab.bat           # Windows: double-click
 ```
 
 ### Using a virtual environment (recommended)
