@@ -41,6 +41,32 @@ def detect_signal_type_from_name(name: str) -> SignalType:
         return SignalType.UNKNOWN
 
 
+def detect_csv_delimiter(path: Path | str, comment: str | None = None) -> str:
+    """Detect the field delimiter (comma or tab) of a CSV/TSV file.
+
+    Shimmer Consensys exports (and the companion peaks/events files derived
+    from them) default to comma but can be configured to use tab instead.
+    Detect by comparing delimiter counts in the header row, i.e. the first
+    non-blank line that is not a comment.
+
+    Args:
+        path: Path to CSV file
+        comment: Optional comment prefix; lines starting with it are skipped
+
+    Returns:
+        Detected delimiter ("," or "\\t"); defaults to "," (e.g. single-column files)
+    """
+    with open(path, "r") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or (comment and stripped.startswith(comment)):
+                continue
+            if line.count("\t") > line.count(","):
+                return "\t"
+            return ","
+    return ","
+
+
 class FileLoader(Protocol):
     """Protocol for file loaders.
 
@@ -797,13 +823,17 @@ class CsvLoader:
         Returns:
             RecordingSession with loaded signals
         """
+        # Shimmer exports use either comma or tab as field delimiter depending
+        # on device/software configuration; detect it from the header row.
+        delimiter = detect_csv_delimiter(path)
+
         # Read the three header rows so we can use calibration status for filtering
         with open(path, "r") as f:
-            column_names = f.readline().strip().split(",")
-            cal_status = f.readline().strip().split(",")  # "CAL" or "RAW" per column
+            column_names = f.readline().strip().split(delimiter)
+            cal_status = f.readline().strip().split(delimiter)  # "CAL" or "RAW" per column
 
         # Load CSV skipping first 3 rows (header metadata)
-        df = pd.read_csv(path, skiprows=3, header=None)
+        df = pd.read_csv(path, skiprows=3, header=None, sep=delimiter)
 
         if len(df) < 2:
             raise ValueError("CSV must have at least 2 data rows")
@@ -977,7 +1007,7 @@ class CsvLoader:
             RecordingSession with loaded signals
         """
         try:
-            df = pd.read_csv(path)
+            df = pd.read_csv(path, sep=detect_csv_delimiter(path))
         except Exception as e:
             raise ValueError(f"Failed to load CSV: {e}")
 
@@ -1158,7 +1188,9 @@ class CsvLoader:
             List of EventData objects
         """
         # Read CSV, skip comment lines
-        df = pd.read_csv(event_path, comment='#')
+        df = pd.read_csv(
+            event_path, comment='#', sep=detect_csv_delimiter(event_path, comment='#')
+        )
 
         events = []
         for _, row in df.iterrows():

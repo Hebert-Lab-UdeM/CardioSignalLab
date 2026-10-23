@@ -11,6 +11,9 @@ load_peaks_binary_csv(path, signal_length)
     as produced by the EKG_Peak_Corrector and similar tools.
     Column name is expected to contain "peak" (case-insensitive).
     All imported peaks are classified MANUAL.
+    Also accepts this app's own RR/NN interval and annotation exports; peaks
+    are mapped by their time columns onto the target signal's samples, and
+    their classifications are preserved.
 """
 from __future__ import annotations
 
@@ -21,6 +24,7 @@ import pandas as pd
 from loguru import logger
 
 from cardio_signal_lab.core.data_models import EventData, PeakClassification, PeakData
+from cardio_signal_lab.core.file_loader import detect_csv_delimiter
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +70,7 @@ def load_events_csv(path: Path | str) -> list[EventData]:
     if not path.exists():
         raise FileNotFoundError(f"Events file not found: {path}")
 
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, sep=detect_csv_delimiter(path))
     if df.empty:
         logger.warning(f"Events CSV is empty: {path}")
         return []
@@ -116,7 +120,11 @@ def load_events_csv(path: Path | str) -> list[EventData]:
 # Peaks
 # ---------------------------------------------------------------------------
 
-def load_peaks_binary_csv(path: Path | str, signal_length: int) -> PeakData:
+def load_peaks_binary_csv(
+    path: Path | str,
+    signal_length: int,
+    signal_timestamps: np.ndarray | None = None,
+) -> PeakData:
     """Load corrected peaks from a binary (0/1) CSV column.
 
     The file must contain a column whose name includes 'peak' (case-insensitive),
@@ -131,6 +139,9 @@ def load_peaks_binary_csv(path: Path | str, signal_length: int) -> PeakData:
     Args:
         path: Path to the CSV file
         signal_length: Expected number of samples (used for bounds checking)
+        signal_timestamps: Timestamps (s) of the target signal. Used to map
+            peak times from this app's RR/NN/annotation exports onto samples,
+            which is independent of the sampling rate at export time.
 
     Returns:
         PeakData with sorted indices and MANUAL classifications
@@ -143,10 +154,15 @@ def load_peaks_binary_csv(path: Path | str, signal_length: int) -> PeakData:
     if not path.exists():
         raise FileNotFoundError(f"Peaks file not found: {path}")
 
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, sep=detect_csv_delimiter(path))
     if df.empty:
         logger.warning(f"Peaks CSV is empty: {path}")
         return PeakData(indices=np.array([], dtype=int), classifications=np.array([], dtype=int))
+
+    # Per-peak / per-interval formats written by this app's own exporters
+    # (core/exporter.py) bypass the binary-column path below.
+    if {"peak1_index", "peak2_index"} <= set(df.columns) or "peak_index" in df.columns:
+        return _load_peaks_from_export(df, path, signal_length, signal_timestamps)
 
     # Find the binary peaks column
     peak_col = None
@@ -241,5 +257,143 @@ def load_peaks_binary_csv(path: Path | str, signal_length: int) -> PeakData:
     logger.info(
         f"Loaded {len(indices)} peaks from {path.name} "
         f"(column='{peak_col}', all MANUAL)"
+    )
+    return PeakData(indices=indices, classifications=classifications)
+
+
+def _parse_classification(value) -> int:
+    """Map a numeric code (0-3) or name (AUTO/MANUAL/ECTOPIC/BAD) to a value.
+
+    Unrecognized or missing values default to MANUAL.
+    """
+    valid_values = {c.value for c in PeakClassification}
+    try:
+        numeric_value = int(value)
+        if numeric_value in valid_values:
+            return numeric_value
+    except (ValueError, TypeError):
+        pass
+    name = str(value).strip().upper()
+    if name in PeakClassification.__members__:
+        return PeakClassification[name].value
+    return PeakClassification.MANUAL.value
+
+
+def _nearest_sample_indices(peak_times: np.ndarray, signal_timestamps: np.ndarray) -> np.ndarray:
+    """Map peak times (s) to the nearest sample index of the target signal.
+
+    Times more than one median sample period outside the signal's time range
+    are returned as -1 so the caller can drop them.
+    """
+    right = np.clip(np.searchsorted(signal_timestamps, peak_times), 1, len(signal_timestamps) - 1)
+    left = right - 1
+    nearest = np.where(
+        peak_times - signal_timestamps[left] <= signal_timestamps[right] - peak_times, left, right
+    )
+    sample_period = np.median(np.diff(signal_timestamps))
+    outside = (peak_times < signal_timestamps[0] - sample_period) | (
+        peak_times > signal_timestamps[-1] + sample_period
+    )
+    return np.where(outside, -1, nearest)
+
+
+def _load_peaks_from_export(
+    df: pd.DataFrame,
+    path: Path,
+    signal_length: int,
+    signal_timestamps: np.ndarray | None,
+) -> PeakData:
+    """Load peaks from the per-peak / per-interval CSV exports of core/exporter.py.
+
+    Supported layouts:
+    - RR/NN intervals (export_intervals): one row per interval with
+      peak1_time_s, peak2_time_s, peak1_index, peak2_index,
+      peak1_classification, peak2_classification. Peaks are the union of
+      both columns of each pair.
+    - Annotations (export_annotations): one row per peak with time_s,
+      peak_index and classification (numeric code) / classification_label.
+
+    Peak positions are taken from the time columns and mapped to the nearest
+    sample of the target signal. The index columns refer to the signal as it
+    was at export time, which is usually cropped and resampled (e.g. the
+    Standard Processing macro resamples to 250 Hz), so they do not match the
+    raw signal's sample grid. Crop/resample keep the original time base, so
+    times remain valid. Index columns are only used if no timestamps are
+    supplied or the file has no time columns.
+
+    Classifications are read from the file; missing ones default to MANUAL.
+
+    Note: an NN-interval export only contains intervals that passed the
+    validity filters, so peaks bounding only excluded intervals (e.g. ECTOPIC
+    or BAD peaks) are absent from the file and cannot be recovered.
+    """
+    if "peak_index" in df.columns:
+        layout = "annotations"
+        time_cols, index_cols = ["time_s"], ["peak_index"]
+        class_col = next(
+            (c for c in ("classification", "classification_label") if c in df.columns), None
+        )
+        class_cols = [class_col]
+    else:
+        layout = "intervals"
+        time_cols, index_cols = ["peak1_time_s", "peak2_time_s"], ["peak1_index", "peak2_index"]
+        class_cols = ["peak1_classification", "peak2_classification"]
+        if "nn_interval_ms" in df.columns:
+            logger.warning(
+                f"{path.name} is an NN-interval export; peaks bounding only excluded "
+                f"intervals (ectopic/bad/invalid) are not in the file and will be missing"
+            )
+
+    def _stack(columns: list[str | None], numeric: bool) -> np.ndarray:
+        parts = []
+        for col in columns:
+            if col is None or col not in df.columns:
+                parts.append(np.full(len(df), np.nan if numeric else None, dtype=float if numeric else object))
+            elif numeric:
+                parts.append(pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float))
+            else:
+                parts.append(df[col].to_numpy())
+        return np.concatenate(parts)
+
+    class_values = _stack(class_cols, numeric=False)
+    use_times = signal_timestamps is not None and all(c in df.columns for c in time_cols)
+
+    if use_times:
+        source_values = _stack(time_cols, numeric=True)
+    else:
+        source_values = _stack(index_cols, numeric=True)
+        logger.warning(
+            f"Using sample-index columns from {path.name}; positions are only correct if "
+            f"the signal has the same sampling rate and crop as at export time"
+        )
+
+    valid_mask = ~np.isnan(source_values)
+    source_values = source_values[valid_mask]
+    class_values = class_values[valid_mask]
+
+    if use_times:
+        index_values = _nearest_sample_indices(source_values, np.asarray(signal_timestamps))
+    else:
+        index_values = source_values.astype(int)
+
+    # Deduplicate (each interior peak appears in two consecutive intervals);
+    # np.unique also sorts, keeping the classification of the first occurrence.
+    indices, first_occurrence = np.unique(index_values, return_index=True)
+    classifications = np.array(
+        [_parse_classification(class_values[i]) for i in first_occurrence], dtype=int
+    )
+
+    out_of_range_mask = (indices < 0) | (indices >= signal_length)
+    if out_of_range_mask.any():
+        logger.warning(
+            f"{int(out_of_range_mask.sum())} peak(s) fall outside the current signal; "
+            f"they will be dropped (was the file exported from a different signal/crop?)"
+        )
+        indices = indices[~out_of_range_mask]
+        classifications = classifications[~out_of_range_mask]
+
+    logger.info(
+        f"Loaded {len(indices)} peaks from {path.name} "
+        f"({layout} export, mapped by {'time' if use_times else 'sample index'})"
     )
     return PeakData(indices=indices, classifications=classifications)

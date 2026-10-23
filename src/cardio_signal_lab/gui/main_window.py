@@ -1880,6 +1880,7 @@ class MainWindow(QMainWindow):
             peak_data = load_peaks_binary_csv(
                 Path(file_path),
                 signal_length=len(self.current_signal.samples),
+                signal_timestamps=self.current_signal.timestamps,
             )
         except Exception as e:
             logger.exception(f"Failed to load peaks: {e}")
@@ -1889,7 +1890,8 @@ class MainWindow(QMainWindow):
         if peak_data.num_peaks == 0:
             QMessageBox.warning(
                 self, "No Peaks Found",
-                f"The file contained no peaks (no 1-values in the peaks column).\n\n"
+                f"The file contained no peaks. Expected a binary 0/1 'peak' column or a "
+                f"CardioSignalLab RR/NN/annotation export (peak index columns).\n\n"
                 f"File: {Path(file_path).name}"
             )
             return
